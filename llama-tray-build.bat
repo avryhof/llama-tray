@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed llama-tray.py
