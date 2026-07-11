@@ -22,12 +22,18 @@ def show_nvidia_window():
 # ── nvidia-smi helpers ────────────────────────────────────────────────────────
 
 def _find_nvidia_smi() -> str | None:
-    import shutil, os
+    import shutil, os, platform
     from tool_detect import _merged_path
     found = shutil.which("nvidia-smi", path=_merged_path())
     if found:
         return found
-    for p in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"]:
+    candidates = ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"]
+    if platform.system() == "Windows":
+        candidates = [
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+            r"C:\Windows\System32\nvidia-smi.exe",
+        ]
+    for p in candidates:
         if Path(p).exists():
             return p
     return None

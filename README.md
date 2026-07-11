@@ -12,7 +12,6 @@ Supports macOS, Windows, and Linux.
 | ▶ Start / ⏹ Stop / ↺ Restart | One-click server lifecycle |
 | 🌐 Open Web UI | Launches your browser to the server's chat UI |
 | 📋 View Logs | Scrollable colour-coded log viewer |
-| 🔍 HuggingFace Browser | Search, browse, and download GGUF models directly |
 | ⚙️ Settings | Full GUI config: binary path, model, host, port, GPU layers, extra flags |
 | Auto-start | Optionally start the server when the applet launches |
 | Tray icon colours | Grey = stopped, Orange = starting, Green = running, Red = error |
@@ -22,20 +21,27 @@ Supports macOS, Windows, and Linux.
 ## Requirements
 
 - Python 3.10+
-- `pystray` and `pillow` (for the tray icon)
-- `tkinter` (for Settings, Logs, and HF Browser windows — included in most Python installs)
+- `pillow` (for the tray icon)
+- `tkinter` (for Settings and Logs windows — included in most Python installs)
 - A compiled **llama-server** binary ([llama.cpp releases](https://github.com/ggerganov/llama.cpp/releases))
 - At least one `.gguf` model file
+
+### Platform-specific dependencies
+
+**Linux (recommended):**
+```bash
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1
+```
+
+**Windows / macOS / Linux fallback:**
+```bash
+pip install pystray
+```
 
 ### Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
-```
-
-On Linux you may also need:
-```bash
-sudo apt-get install python3-tk   # Ubuntu/Debian
 ```
 
 ---
@@ -44,35 +50,23 @@ sudo apt-get install python3-tk   # Ubuntu/Debian
 
 ```bash
 # 1. Install deps
-pip install pystray pillow
+pip install pillow
 
 # 2. Run the applet
-python llama_tray.py
+python main.py
 ```
+
+On Linux, the app automatically uses native GTK3/AppIndicator3 if available.
+If GTK3 is not installed, it falls back to pystray.
 
 A tray icon appears in your system tray.
 
 **First-time setup:**
 1. Right-click the icon → **⚙️ Settings → General**
 2. Set the path to your `llama-server` binary
-3. Set your active model (`.gguf` file), or use the HF Browser to download one
+3. Set your active model (`.gguf` file)
 4. Click **Save**
 5. Right-click → **▶ Start Server**
-
----
-
-## HuggingFace Model Browser
-
-Right-click → **🔍 Browse HuggingFace Models**
-
-1. Type a search query (e.g. `mistral gguf`, `llama 3 gguf`, `phi-3 gguf`)
-2. Click a model on the left → its GGUF files appear on the right
-3. Select a file → click **⬇ Download & Activate**
-4. The model is downloaded to your models directory and set as the active model
-5. Restart the server to load the new model
-
-**HuggingFace token** (optional): needed only for gated/private models.
-Get one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
 
 ---
 
@@ -100,7 +94,6 @@ Settings are stored as JSON in a platform-appropriate location:
 | `n_gpu_layers` | `0` | Layers offloaded to GPU (`-ngl`); 0 = CPU only |
 | `extra_flags` | `""` | Extra raw CLI flags (e.g. `--threads 8 --mlock`) |
 | `hf_token` | `""` | HuggingFace API token (optional) |
-| `hf_search_query` | `"gguf"` | Default search query in the HF Browser |
 | `auto_start` | `false` | Start server automatically when applet launches |
 
 ---
@@ -119,7 +112,7 @@ Create `~/Library/LaunchAgents/com.llama_tray.plist`:
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/path/to/llama_tray/llama_tray.py</string>
+        <string>/path/to/llama-tray/main.py</string>
     </array>
     <key>RunAtLoad</key><true/>
 </dict>
@@ -129,7 +122,7 @@ Then: `launchctl load ~/Library/LaunchAgents/com.llama_tray.plist`
 
 ### Windows (Task Scheduler)
 
-Create a task that runs `pythonw.exe llama_tray.py` at login.
+Create a task that runs `pythonw.exe main.py` at login.
 (`pythonw.exe` suppresses the console window.)
 
 ### Linux (autostart)
@@ -139,10 +132,27 @@ Create `~/.config/autostart/llama_tray.desktop`:
 [Desktop Entry]
 Type=Application
 Name=llama.cpp Tray
-Exec=python3 /path/to/llama_tray/llama_tray.py
+Exec=python3 /path/to/llama-tray/main.py
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
+```
+
+---
+
+## Architecture
+
+```
+main.py            Entry point — detects OS, loads appropriate backend
+tray_base.py       Shared logic (server management, config, logging)
+tray_gtk.py        Linux/GTK3 implementation (native)
+tray_pystray.py    Windows/macOS/Linux fallback (pystray)
+config.py          Config persistence
+tool_detect.py     Cross-platform tool detection
+model_manager.py   Model management GUI
+settings_window.py Settings dialog
+log_window.py      Log viewer
+nvidia_window.py   GPU monitor
 ```
 
 ---
@@ -159,11 +169,3 @@ extract it, and set the path in Settings → General.
 
 **Server starts but Web UI is blank:**
 Make sure you have a model set. Check the Logs window for details.
-
-**Download fails from HuggingFace:**
-Large files (>10 GB) may time out. You can also download via `huggingface-cli`:
-```bash
-pip install huggingface_hub
-huggingface-cli download <repo_id> <filename> --local-dir ~/models
-```
-Then set the path in Settings → General → Active model.

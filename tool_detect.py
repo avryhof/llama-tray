@@ -9,13 +9,18 @@ interactive terminal builds by sourcing ~/.bashrc.  Tools installed by npm
 `which foo` in a terminal works fine.
 
 Fix: ask a login shell for its PATH, then use that for all lookups.
+On Windows, PATH is already inherited correctly, so we skip this step.
 """
 
 import os
+import platform
 import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
+
+OS = platform.system()
+SEP = ";" if OS == "Windows" else ":"
 
 
 # ── Get the login shell's PATH ────────────────────────────────────────────────
@@ -23,10 +28,13 @@ from pathlib import Path
 @lru_cache(maxsize=1)
 def _login_path() -> str:
     """
-    Launch a bash login shell, print its PATH, return it.
+    On Linux/macOS: launch a bash login shell, print its PATH, return it.
+    On Windows: return the current process PATH (Windows inherits correctly).
     Falls back to os.environ["PATH"] if bash isn't available.
     Cached after the first call.
     """
+    if OS == "Windows":
+        return os.environ.get("PATH", "")
     try:
         result = subprocess.run(
             ["bash", "--login", "-c", "echo $PATH"],
@@ -42,15 +50,15 @@ def _login_path() -> str:
 
 def _merged_path() -> str:
     """Merge the login shell PATH with the current process PATH, deduped."""
-    login  = _login_path().split(":")
-    current = os.environ.get("PATH", "").split(":")
+    login   = _login_path().split(SEP)
+    current = os.environ.get("PATH", "").split(SEP)
     seen = set()
     merged = []
     for d in login + current:
         if d and d not in seen:
             seen.add(d)
             merged.append(d)
-    return ":".join(merged)
+    return SEP.join(merged)
 
 
 # ── Find a single binary ──────────────────────────────────────────────────────
@@ -87,9 +95,21 @@ CONTINUE_CONFIG_PATHS = [
     Path.home() / ".continue" / "config.json",
     Path.home() / ".config" / "continue" / "config.json",
 ]
+if OS == "Windows":
+    _appdata = Path(os.environ.get("APPDATA", Path.home()))
+    CONTINUE_CONFIG_PATHS.append(_appdata / "Continue" / "config.json")
 
 # opencode global config
 OPENCODE_CONFIG_DEFAULT = Path.home() / ".config" / "opencode" / "config.json"
+if OS == "Windows":
+    _appdata = Path(os.environ.get("APPDATA", Path.home()))
+    OPENCODE_CONFIG_DEFAULT = _appdata / "opencode" / "config.json"
+
+# opencode auth (provider credentials)
+OPENCODE_AUTH_DEFAULT = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+if OS == "Windows":
+    OPENCODE_AUTH_DEFAULT = (Path(os.environ.get("LOCALAPPDATA", Path.home()))
+                             / "opencode" / "auth.json")
 
 
 def detect_tools(overrides: dict | None = None) -> dict[str, str | None]:

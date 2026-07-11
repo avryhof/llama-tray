@@ -5,26 +5,116 @@ Tabs:
   1. My Models    — browse/activate/delete local .gguf files
   2. HuggingFace  — search & download GGUF models from HF
   3. llmfit       — hardware-scored model browser via llmfit serve API
-  4. Leaderboard  — llmfit community benchmark leaderboard
-  5. opencode     — write llama.cpp provider into opencode config
-  6. VS Code      — write llama.cpp into chatLanguageModels.json
+  4. opencode     — write llama.cpp provider into opencode config
+  5. VS Code      — write llama.cpp into chatLanguageModels.json
 """
 
 import json
 import os
+import platform
 import re
 import subprocess
 import threading
 import time
 import urllib.request
 import urllib.parse
-import urllib.error
+
 from pathlib import Path
 
-from tool_detect import detect_tools, find_binary, CONTINUE_CONFIG_PATHS, OPENCODE_CONFIG_DEFAULT
+OS = platform.system()
+
+from huggingface_hub import HfApi, hf_hub_download
+
+from tool_detect import (detect_tools, find_binary, CONTINUE_CONFIG_PATHS,
+                         OPENCODE_CONFIG_DEFAULT, OPENCODE_AUTH_DEFAULT)
+
+from model_router import (load_models_ini, save_models_ini, default_models_ini_path,
+                          list_gguf_files as router_list_gguf, model_name_from_path,
+                          make_model_entry, add_model_to_data, remove_model_from_data,
+                          toggle_model_active, models_ini_as_text)
 
 LLMFIT_PORT = 8787
 LLMFIT_BASE = f"http://127.0.0.1:{LLMFIT_PORT}"
+
+
+# ── Cross-platform helpers ────────────────────────────────────────────────────
+
+def _open_folder(path: Path):
+    """Open a folder in the system file manager."""
+    folder = str(path)
+    if OS == "Windows":
+        subprocess.Popen(["explorer", folder])
+    elif OS == "Darwin":
+        subprocess.Popen(["open", folder])
+    else:
+        subprocess.Popen(["xdg-open", folder])
+
+
+def _kill_port(port: int) -> bool:
+    """Kill whatever process is listening on *port*. Returns True if killed."""
+    import signal as _sig
+    killed = False
+
+    if OS == "Windows":
+        # Windows: use netstat + taskkill
+        try:
+            r = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = set()
+            for line in r.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    if parts:
+                        try:
+                            pids.add(int(parts[-1]))
+                        except ValueError:
+                            pass
+            for pid in pids:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True, timeout=5,
+                    )
+                    killed = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        # Linux/macOS: fuser → lsof fallback
+        try:
+            r = subprocess.run(
+                ["fuser", "-k", "-TERM", f"{port}/tcp"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0:
+                killed = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+        if not killed:
+            try:
+                r = subprocess.run(
+                    ["lsof", "-ti", f"tcp:{port}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                pids = [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+                for pid in pids:
+                    try:
+                        os.kill(pid, _sig.SIGTERM)
+                        killed = True
+                    except ProcessLookupError:
+                        pass
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+    return killed
 
 
 # ── llmfit REST helpers ───────────────────────────────────────────────────────
@@ -184,6 +274,16 @@ def _show(llama_config, on_save):
         mdir = Path(v_mdir.get())
         active = cfg().get("active_model", "")
         ml.delete(*ml.get_children())
+
+        # Load current router data to check membership
+        router_names = set()
+        try:
+            rtr_path = default_models_ini_path()
+            rtr_data = load_models_ini(rtr_path)
+            router_names = {m["name"] for m in rtr_data.get("models", [])}
+        except Exception:
+            pass
+
         if not mdir.is_dir():
             mine_status.config(text=f"Not a directory: {mdir}")
             return
@@ -192,8 +292,10 @@ def _show(llama_config, on_save):
             size_b = f.stat().st_size
             size_s = _fmt_size(size_b)
             is_act = str(f) == active
+            mname = model_name_from_path(f.name)
+            in_router = "R" if mname in router_names else ""
             ml.insert("", "end",
-                      values=("✓" if is_act else "", f.name, size_s, str(f)),
+                      values=("✓" if is_act else "", f.name, size_s, in_router, str(f)),
                       tags=("active",) if is_act else ())
         ml.tag_configure("active", foreground="#56d364", font=("Helvetica", 9, "bold"))
         mine_status.config(text=f"{len(files)} model(s) in {mdir}")
@@ -203,9 +305,9 @@ def _show(llama_config, on_save):
     ttk.Button(dir_row, text="↺ Refresh", command=_refresh_mine).pack(side="left", padx=4)
 
     ml = _scrolled_treeview(t_mine,
-        columns=("active", "name", "size", "path"),
-        headings=("", "File name", "Size", "Full path"),
-        widths=(30, 280, 80, 400), height=16)
+        columns=("active", "name", "size", "router", "path"),
+        headings=("", "File name", "Size", "Router", "Full path"),
+        widths=(30, 280, 80, 50, 400), height=16)
 
     mine_status = tk.Label(t_mine, text="", anchor="w", fg="#555", font=("Helvetica", 9))
     mine_status.pack(fill="x")
@@ -214,7 +316,7 @@ def _show(llama_config, on_save):
         sel = ml.selection()
         if not sel:
             return
-        path = ml.item(sel[0])["values"][3]
+        path = ml.item(sel[0])["values"][4]
         llama_config.set("active_model", str(path))
         if on_save:
             on_save()
@@ -227,7 +329,7 @@ def _show(llama_config, on_save):
         sel = ml.selection()
         if not sel:
             return
-        path = ml.item(sel[0])["values"][3]
+        path = ml.item(sel[0])["values"][4]
         if messagebox.askyesno("Delete", f"Permanently delete:\n{Path(path).name}?"):
             try:
                 Path(path).unlink()
@@ -239,14 +341,40 @@ def _show(llama_config, on_save):
         sel = ml.selection()
         if not sel:
             return
-        path = ml.item(sel[0])["values"][3]
-        subprocess.Popen(["xdg-open", str(Path(path).parent)])
+        path = ml.item(sel[0])["values"][4]
+        _open_folder(Path(path).parent)
+
+    def _toggle_router_mine():
+        """Add or remove the selected model from the router preset."""
+        sel = ml.selection()
+        if not sel:
+            return
+        path = ml.item(sel[0])["values"][4]
+        fname = ml.item(sel[0])["values"][1]
+        mname = model_name_from_path(fname)
+
+        rtr_path = default_models_ini_path()
+        rtr_data = load_models_ini(rtr_path)
+        existing = {m["name"] for m in rtr_data.get("models", [])}
+
+        if mname in existing:
+            remove_model_from_data(rtr_data, mname)
+            save_models_ini(rtr_path, rtr_data)
+        else:
+            entry = make_model_entry(mname, local_path=str(path))
+            add_model_to_data(rtr_data, entry)
+            save_models_ini(rtr_path, rtr_data)
+
+        _refresh_mine()
 
     act_row = tk.Frame(t_mine)
     act_row.pack(fill="x", pady=4)
     ttk.Button(act_row, text="✓  Set Active",       command=_activate_selected_mine).pack(side="left", padx=2)
     ttk.Button(act_row, text="📂  Reveal in Files", command=_reveal_selected_mine).pack(side="left", padx=2)
     ttk.Button(act_row, text="🗑  Delete",           command=_delete_selected_mine).pack(side="left", padx=2)
+    ttk.Separator(act_row, orient="vertical").pack(side="left", fill="y", padx=6)
+    ttk.Button(act_row, text="R  Toggle Router",
+               command=lambda: _toggle_router_mine()).pack(side="left", padx=2)
 
     _refresh_mine()
 
@@ -262,9 +390,6 @@ def _show(llama_config, on_save):
     v_hf_q = tk.StringVar(value=cfg().get("hf_search_query", "gguf"))
     hf_entry = tk.Entry(hf_search_row, textvariable=v_hf_q, width=36)
     hf_entry.pack(side="left", padx=4)
-    tk.Label(hf_search_row, text="HF Token:", anchor="w").pack(side="left", padx=(8, 2))
-    v_hf_tok = tk.StringVar(value=cfg().get("hf_token", ""))
-    tk.Entry(hf_search_row, textvariable=v_hf_tok, show="*", width=24).pack(side="left")
     hf_search_btn = ttk.Button(hf_search_row, text="Search")
     hf_search_btn.pack(side="left", padx=6)
 
@@ -317,16 +442,9 @@ def _show(llama_config, on_save):
     _hf_files:  list[dict] = []
     _hf_repo:   dict = {}
 
-    HF_API = "https://huggingface.co/api"
-    HF_CDN = "https://huggingface.co"
-
-    def _hf_req(url):
-        req = urllib.request.Request(url)
-        tok = v_hf_tok.get().strip()
-        if tok:
-            req.add_header("Authorization", f"Bearer {tok}")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode())
+    def _hf_api():
+        tok = cfg().get("hf_token", "").strip() or None
+        return HfApi(token=tok)
 
     def _hf_fmt_size(b):
         if b is None:
@@ -342,7 +460,6 @@ def _show(llama_config, on_save):
         if not q:
             return
         llama_config.set("hf_search_query", q)
-        llama_config.set("hf_token", v_hf_tok.get().strip())
         hf_model_list.delete(0, "end")
         hf_file_tree.delete(*hf_file_tree.get_children())
         hf_dl_btn.config(state="disabled")
@@ -351,20 +468,22 @@ def _show(llama_config, on_save):
 
         def _do():
             try:
-                params = urllib.parse.urlencode({
-                    "search": q, "filter": "gguf",
-                    "limit": 30, "sort": "downloads", "direction": -1,
-                })
-                data = _hf_req(f"{HF_API}/models?{params}")
+                api = _hf_api()
+                models = list(api.list_models(
+                    search=q, filter="gguf", limit=30,
+                    sort="downloads", direction=-1,
+                ))
+                data = [{"id": m.id, "downloads": m.downloads or 0}
+                        for m in models]
                 nonlocal _hf_models
                 _hf_models = data
 
                 def _upd():
                     hf_model_list.delete(0, "end")
                     for m in data:
-                        dl = m.get("downloads", 0)
+                        dl = m["downloads"]
                         k = f"{dl//1000}k" if dl >= 1000 else str(dl)
-                        hf_model_list.insert("end", f"{'↓'+k:>7}  {m.get('id','')}")
+                        hf_model_list.insert("end", f"{'↓'+k:>7}  {m['id']}")
                     hf_status.config(text=f"{len(data)} models found.")
                     hf_search_btn.config(state="normal")
                 root.after(0, _upd)
@@ -388,9 +507,12 @@ def _show(llama_config, on_save):
 
         def _do():
             try:
-                info = _hf_req(f"{HF_API}/models/{repo.get('id','')}")
-                siblings = info.get("siblings", [])
-                files = [s for s in siblings if s.get("rfilename", "").endswith(".gguf")]
+                api = _hf_api()
+                info = api.repo_info(repo.get("id", ""))
+                siblings = info.siblings or []
+                files = [{"rfilename": s.rfilename, "size": s.size}
+                         for s in siblings
+                         if s.rfilename and s.rfilename.endswith(".gguf")]
                 nonlocal _hf_files
                 _hf_files = files
 
@@ -398,7 +520,7 @@ def _show(llama_config, on_save):
                     hf_file_tree.delete(*hf_file_tree.get_children())
                     for f in files:
                         hf_file_tree.insert("", "end",
-                            values=(f.get("rfilename", ""),
+                            values=(f["rfilename"],
                                     _hf_fmt_size(f.get("size"))))
                     hf_status.config(text=f"{len(files)} GGUF file(s).")
                 root.after(0, _upd)
@@ -415,7 +537,6 @@ def _show(llama_config, on_save):
             return
         filename = hf_file_tree.item(sel[0])["values"][0]
         repo_id  = _hf_repo.get("id", "")
-        url      = f"{HF_CDN}/{repo_id}/resolve/main/{filename}"
         dest_dir = Path(v_hf_dir.get())
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest     = dest_dir / filename
@@ -426,43 +547,28 @@ def _show(llama_config, on_save):
 
         hf_dl_btn.config(state="disabled")
         hf_dl_prog.pack(fill="x", pady=2)
-        hf_dl_prog["value"] = 0
+        hf_dl_prog.config(mode="indeterminate")
+        hf_dl_prog.start(10)
 
         def _do():
             try:
-                req = urllib.request.Request(url)
-                tok = v_hf_tok.get().strip()
-                if tok:
-                    req.add_header("Authorization", f"Bearer {tok}")
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    total = int(r.headers.get("Content-Length", 0))
-                    done  = 0
-                    with open(dest, "wb") as out:
-                        while True:
-                            buf = r.read(262144)
-                            if not buf:
-                                break
-                            out.write(buf)
-                            done += len(buf)
-                            if total:
-                                pct = done / total * 100
-                                mb  = done / 1_048_576
-                                tmb = total / 1_048_576
-                                root.after(0, lambda p=pct, m=mb, t=tmb: (
-                                    hf_dl_prog.config(value=p),
-                                    hf_status.config(
-                                        text=f"Downloading… {m:.0f}/{t:.0f} MB ({p:.0f}%)"
-                                    )
-                                ))
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    local_dir=str(dest_dir),
+                    token=cfg().get("hf_token", "").strip() or None,
+                )
                 root.after(0, lambda: _hf_finish(dest))
             except Exception as e:
                 root.after(0, lambda: (
                     hf_status.config(text=f"Download error: {e}"),
                     hf_dl_btn.config(state="normal"),
+                    hf_dl_prog.stop(),
                     hf_dl_prog.pack_forget(),
                 ))
 
         def _hf_finish(path):
+            hf_dl_prog.stop()
             hf_dl_prog.pack_forget()
             hf_dl_btn.config(state="normal")
             hf_status.config(text=f"✅  {path.name}")
@@ -510,22 +616,68 @@ def _show(llama_config, on_save):
             lmf_srv_lbl.config(text="● llmfit server running", fg="#28a745")
             lmf_start_btn.config(state="disabled")
             lmf_stop_btn.config(state="normal")
-            _lmf_load_hw()
         else:
             lmf_srv_lbl.config(text="○ llmfit server stopped", fg="#dc3545")
             lmf_start_btn.config(state="normal")
             lmf_stop_btn.config(state="disabled")
-            lmf_hw_lbl.config(text="")
 
     def _lmf_load_hw():
         def _do():
-            d = _lmf_get("/api/v1/system")
-            if d:
-                gpu  = d.get("gpu", {})
-                txt  = (f"GPU: {gpu.get('name','?')}  "
-                        f"VRAM: {gpu.get('vram_gb','?')} GB  "
-                        f"RAM: {d.get('ram_gb','?')} GB")
-                root.after(0, lambda: lmf_hw_lbl.config(text=txt))
+            gpu_name = vram_gb = ram_gb = None
+
+            # Try nvidia-smi directly
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi",
+                     "--query-gpu=name,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    line = r.stdout.strip().split("\n")[0]
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 2:
+                        gpu_name = parts[0]
+                        vram_gb = round(int(parts[1]) / 1024, 1)
+            except Exception:
+                pass
+
+            # Try /proc/meminfo for RAM
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            kb = int(line.split()[1])
+                            ram_gb = round(kb / 1048576, 1)
+                            break
+            except Exception:
+                pass
+
+            # Fallback to llmfit API if direct detection missed something
+            if gpu_name is None or ram_gb is None:
+                d = _lmf_get("/api/v1/system")
+                if d:
+                    g = d.get("gpu", {})
+                    if gpu_name is None:
+                        gpu_name = g.get("name")
+                    if vram_gb is None:
+                        v = g.get("vram_gb")
+                        if v is not None:
+                            vram_gb = round(float(v), 1)
+                    if ram_gb is None:
+                        r = d.get("ram_gb")
+                        if r is not None:
+                            ram_gb = round(float(r), 1)
+
+            parts = []
+            if gpu_name:
+                parts.append(f"GPU: {gpu_name}")
+            if vram_gb is not None:
+                parts.append(f"VRAM: {vram_gb} GB")
+            if ram_gb is not None:
+                parts.append(f"RAM: {ram_gb} GB")
+            txt = "  ".join(parts) if parts else "Hardware info unavailable"
+            root.after(0, lambda: lmf_hw_lbl.config(text=txt))
         threading.Thread(target=_do, daemon=True).start()
 
     def _lmf_start():
@@ -561,44 +713,10 @@ def _show(llama_config, on_save):
         """
         Kill whatever process is listening on LLMFIT_PORT.
         Works whether we started it or it was already running externally.
-        Uses fuser (most reliable on Linux) with pkill as fallback.
         """
-        import signal as _sig
-        killed = False
+        _kill_port(LLMFIT_PORT)
 
-        # Strategy 1: fuser -k kills everything on the port instantly
-        try:
-            result = subprocess.run(
-                ["fuser", "-k", "-TERM", f"{LLMFIT_PORT}/tcp"],
-                capture_output=True, timeout=5,
-            )
-            if result.returncode == 0:
-                killed = True
-        except FileNotFoundError:
-            pass  # fuser not installed, try next
-        except Exception:
-            pass
-
-        # Strategy 2: lsof to find PIDs, then kill them
-        if not killed:
-            try:
-                result = subprocess.run(
-                    ["lsof", "-ti", f"tcp:{LLMFIT_PORT}"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                pids = [int(p) for p in result.stdout.split() if p.strip().isdigit()]
-                for pid in pids:
-                    try:
-                        os.kill(pid, _sig.SIGTERM)
-                        killed = True
-                    except ProcessLookupError:
-                        pass
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
-
-        # Strategy 3: also terminate our own Popen handle if we have one
+        # Also terminate our own Popen handle if we have one
         p = _lmf_proc[0]
         if p and p.poll() is None:
             try:
@@ -613,7 +731,6 @@ def _show(llama_config, on_save):
                 except Exception:
                     pass
         _lmf_proc[0] = None
-        return killed
 
     def _lmf_stop():
         lmf_stop_btn.config(state="disabled")
@@ -811,80 +928,66 @@ def _show(llama_config, on_save):
         threading.Thread(target=_worker, daemon=True).start()
 
     root.after(600, _lmf_update_status)
+    root.after(400, _lmf_load_hw)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # TAB 4 — llmfit Leaderboard
-    # ═══════════════════════════════════════════════════════════════════════════
-    t_lb = _tab("Leaderboard")
-
-    lb_top = tk.Frame(t_lb)
-    lb_top.pack(fill="x", pady=(0, 6))
-    tk.Label(lb_top,
-             text="Community benchmark data from localmaxxing.com via llmfit.",
-             fg="#555", font=("Helvetica", 9)).pack(side="left")
-    lb_ref_btn = ttk.Button(lb_top, text="↺ Fetch", command=lambda: _lb_fetch())
-    lb_ref_btn.pack(side="right")
-
-    lb_tv = _scrolled_treeview(t_lb,
-        columns=("model","gpu","tps","ttft","vram","quant","ctx"),
-        headings=("Model","GPU","tok/s","TTFT ms","VRAM GB","Quant","Context"),
-        widths=(240,160,60,70,70,80,75), height=18)
-    lb_tv.tag_configure("fast", foreground="#56d364")
-    lb_tv.tag_configure("med",  foreground="#79c0ff")
-    lb_tv.tag_configure("slow", foreground="#e3b341")
-
-    lb_status = tk.Label(t_lb, text="Requires llmfit server to be running.",
-                          anchor="w", fg="#555", font=("Helvetica", 9))
-    lb_status.pack(fill="x")
-
-    def _lb_fetch():
-        if not _llmfit_running():
-            lb_status.config(
-                text="llmfit server not running — start it in the llmfit tab.")
-            return
-        lb_status.config(text="Fetching leaderboard…")
-        lb_ref_btn.config(state="disabled")
-
-        def _do():
-            # llmfit leaderboard endpoint
-            data = _lmf_get("/api/v1/leaderboard", timeout=20)
-            if not data:
-                root.after(0, lambda: lb_status.config(
-                    text="Leaderboard endpoint not available in this llmfit version."))
-                root.after(0, lambda: lb_ref_btn.config(state="normal"))
-                return
-            entries = data.get("entries", data.get("results", []))
-
-            def _upd():
-                lb_tv.delete(*lb_tv.get_children())
-                for e in entries:
-                    tps = e.get("tps", e.get("tokens_per_second", 0))
-                    tag = "fast" if tps > 30 else ("med" if tps > 10 else "slow")
-                    lb_tv.insert("", "end", values=(
-                        e.get("model", e.get("model_name", "")),
-                        e.get("gpu",   e.get("gpu_name", "")),
-                        f"{tps:.1f}" if isinstance(tps, float) else str(tps),
-                        str(e.get("ttft", e.get("time_to_first_token", ""))),
-                        str(e.get("vram_gb", "")),
-                        e.get("quant", e.get("quantization", "")),
-                        str(e.get("context", e.get("ctx_size", ""))),
-                    ), tags=(tag,))
-                lb_status.config(text=f"{len(entries)} entries.")
-                lb_ref_btn.config(state="normal")
-            root.after(0, _upd)
-        threading.Thread(target=_do, daemon=True).start()
-
-    # snap and _detected_once used by TAB 5 (opencode) and TAB 6 (VS Code)
+    # snap and _detected_once used by TAB 4 (opencode) and TAB 5 (VS Code)
     snap = cfg()
     _detected_once = detect_tools(snap)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # TAB 5 — opencode
+    # TAB 4 — opencode
     # ═══════════════════════════════════════════════════════════════════════════
     t_oc = _tab("opencode")
     t_oc.columnconfigure(1, weight=1)
 
+    # ── Server selector for opencode ──────────────────────────────────────
+    _oc_servers = llama_config.servers()
+    _oc_server_names = [f"{s['name']} ({s['host']}:{s['port']})" for s in _oc_servers]
+    _oc_selected_server = [None]  # mutable for closure
+
+    _oc_sf_hdr = tk.LabelFrame(t_oc, text="Server", padx=8, pady=4)
+    _oc_sf_hdr.pack(fill="x", pady=(0, 4))
+    _oc_sf_hdr.columnconfigure(1, weight=1)
+    tk.Label(_oc_sf_hdr, text="Configure for:", anchor="w").grid(row=0, column=0, sticky="w")
+    _oc_server_var = tk.StringVar()
+    _oc_server_cb = ttk.Combobox(_oc_sf_hdr, textvariable=_oc_server_var,
+                                  values=_oc_server_names, state="readonly", width=36)
+    _oc_server_cb.grid(row=0, column=1, sticky="w", padx=4)
+
+    def _oc_on_server_select(_event=None):
+        idx = _oc_server_cb.current()
+        if idx < 0 or idx >= len(_oc_servers):
+            return
+        srv = _oc_servers[idx]
+        _oc_selected_server[0] = srv
+        # Update host/port from selected server
+        v_oc_host.set(srv.get("host", "127.0.0.1"))
+        v_oc_port.set(srv.get("port", 8080))
+        v_oc_ctx.set(srv.get("ctx_size", 16384))
+        m = srv.get("active_model", "")
+        if m:
+            stem = Path(m).stem
+            v_oc_mid.set(stem)
+            v_oc_name.set(stem.replace("-", " ").replace("_", " "))
+        # Try to load existing provider for this server
+        prov_key = "llama.cpp" if srv.get("is_local") else f"llama-{srv['name'].lower().replace(' ', '-')}"
+        prov = oc_data.get("provider", {}).get(prov_key, {})
+        if prov:
+            url = prov.get("options", {}).get("baseURL", "")
+            mu = re.match(r"http://([^:/]+):(\d+)/v1", url)
+            if mu:
+                v_oc_host.set(mu.group(1))
+                v_oc_port.set(int(mu.group(2)))
+            mods = prov.get("models", {})
+            if mods:
+                mid = next(iter(mods))
+                v_oc_mid.set(mid)
+                v_oc_name.set(mods[mid].get("name", mid))
+
+    _oc_server_cb.bind("<<ComboboxSelected>>", _oc_on_server_select)
+
     oc_cfg_path_str = (snap.get("tool_opencode_config") or str(OPENCODE_CONFIG_DEFAULT))
+    oc_auth_path_str = str(OPENCODE_AUTH_DEFAULT)
     oc_data   = _rw_json(Path(oc_cfg_path_str))
     oc_prov   = oc_data.get("provider", {}).get("llama.cpp", {})
     oc_mods   = oc_prov.get("models", {})
@@ -900,6 +1003,7 @@ def _show(llama_config, on_save):
     oc_bin = snap.get("tool_opencode_path") or _detected_once.get("opencode")
     _badge(oc_sf, f"opencode: {oc_bin or 'not found'}", bool(oc_bin))
     _badge(oc_sf, f"Config:   {oc_cfg_path_str}", Path(oc_cfg_path_str).exists())
+    _badge(oc_sf, f"Auth:     {oc_auth_path_str}", Path(oc_auth_path_str).exists())
 
     pf = tk.LabelFrame(t_oc, text="llama.cpp Provider", padx=10, pady=8)
     pf.pack(fill="x", pady=4)
@@ -924,27 +1028,71 @@ def _show(llama_config, on_save):
         row=6, column=0, columnspan=2, sticky="w", pady=4)
 
     def _oc_sync():
-        c = cfg()
-        v_oc_host.set(c.get("host", "127.0.0.1"))
-        v_oc_port.set(c.get("port", 8080))
-        v_oc_ctx.set(c.get("ctx_size", 16384))
-        m = c.get("active_model", "")
-        if m:
-            stem = Path(m).stem
-            v_oc_mid.set(stem)
-            v_oc_name.set(stem.replace("-"," ").replace("_"," "))
-    ttk.Button(t_oc, text="↻ Sync from llama_tray config", command=_oc_sync
+        srv = _oc_selected_server[0]
+        if srv:
+            v_oc_host.set(srv.get("host", "127.0.0.1"))
+            v_oc_port.set(srv.get("port", 8080))
+            v_oc_ctx.set(srv.get("ctx_size", 16384))
+            m = srv.get("active_model", "")
+            if m:
+                stem = Path(m).stem
+                v_oc_mid.set(stem)
+                v_oc_name.set(stem.replace("-", " ").replace("_", " "))
+            # Pull API key from server config
+            v_oc_apikey.set(srv.get("api_key", ""))
+        else:
+            # Fallback to global config
+            c = cfg()
+            v_oc_host.set(c.get("host", "127.0.0.1"))
+            v_oc_port.set(c.get("port", 8080))
+            v_oc_ctx.set(c.get("ctx_size", 16384))
+            m = c.get("active_model", "")
+            if m:
+                stem = Path(m).stem
+                v_oc_mid.set(stem)
+                v_oc_name.set(stem.replace("-", " ").replace("_", " "))
+    ttk.Button(t_oc, text="↻ Sync from server config", command=_oc_sync
                ).pack(anchor="w", pady=4)
 
-    tk.Label(t_oc, text="Preview:", fg="#888", font=("Helvetica", 8),
-             anchor="w").pack(anchor="w")
+    # ── auth.json section ─────────────────────────────────────────────────
+    auth_sf = tk.LabelFrame(t_oc, text="Credentials (auth.json)", padx=10, pady=6)
+    auth_sf.pack(fill="x", pady=4)
+    auth_sf.columnconfigure(1, weight=1)
+
+    oc_auth_data = _rw_json(Path(oc_auth_path_str))
+    existing_key = oc_auth_data.get("llama.cpp", {}).get("apiKey", "")
+
+    _lbl(auth_sf, "API key", 0)
+    v_oc_apikey = _strvar(auth_sf, 0, existing_key, width=36)
+    tk.Label(auth_sf, text="For local llama.cpp, any value works (or leave empty).",
+             fg="#888", font=("Helvetica", 8), anchor="w").grid(
+        row=1, column=0, columnspan=2, sticky="w")
+
+    # ── Preview ───────────────────────────────────────────────────────────
+    tk.Label(t_oc, text="Config preview (merged with existing):", fg="#888",
+             font=("Helvetica", 8), anchor="w").pack(anchor="w")
     oc_prev = _code_box(t_oc, height=8)
 
     def _oc_refresh(*_):
         try:
+            # Start from the existing config on disk
+            merged = _rw_json(Path(oc_cfg_path_str))
+            merged["$schema"] = "https://opencode.ai/config.json"
+            merged.setdefault("provider", {})
+
+            # Determine provider key based on selected server
+            srv = _oc_selected_server[0]
+            if srv:
+                prov_key = "llama.cpp" if srv.get("is_local") else f"llama-{srv['name'].lower().replace(' ', '-')}"
+                prov_name = f"llama-server ({srv['name']})"
+            else:
+                prov_key = "llama.cpp"
+                prov_name = "llama-server (local)"
+
+            # Build the llama.cpp provider block
             block = {
                 "npm": "@ai-sdk/openai-compatible",
-                "name": "llama-server (local)",
+                "name": prov_name,
                 "options": {"baseURL": f"http://{v_oc_host.get()}:{v_oc_port.get()}/v1"},
                 "models": {v_oc_mid.get(): {
                     "name": v_oc_name.get(),
@@ -952,11 +1100,14 @@ def _show(llama_config, on_save):
                               "output":  int(v_oc_out.get())}
                 }}
             }
-            snap2 = {"$schema": "https://opencode.ai/config.json",
-                     "provider": {"llama.cpp": block}}
+            merged["provider"][prov_key] = block
+
             if v_oc_def.get():
-                snap2["model"] = f"llama.cpp/{v_oc_mid.get()}"
-            _code_put(oc_prev, json.dumps(snap2, indent=2))
+                merged["model"] = f"{prov_key}/{v_oc_mid.get()}"
+            elif merged.get("model", "").startswith(("llama.cpp/", "llama-")):
+                del merged["model"]
+
+            _code_put(oc_prev, json.dumps(merged, indent=2))
         except Exception as e:
             _code_put(oc_prev, f"(error: {e})")
 
@@ -969,13 +1120,23 @@ def _show(llama_config, on_save):
 
     def _oc_save():
         try:
+            # Determine provider key based on selected server
+            srv = _oc_selected_server[0]
+            if srv:
+                prov_key = "llama.cpp" if srv.get("is_local") else f"llama-{srv['name'].lower().replace(' ', '-')}"
+                prov_name = f"llama-server ({srv['name']})"
+            else:
+                prov_key = "llama.cpp"
+                prov_name = "llama-server (local)"
+
+            # ── Save config.json ──────────────────────────────────────────
             dst = Path(snap.get("tool_opencode_config") or str(OPENCODE_CONFIG_DEFAULT))
             data = _rw_json(dst)
             data["$schema"] = "https://opencode.ai/config.json"
             data.setdefault("provider", {})
-            data["provider"]["llama.cpp"] = {
+            data["provider"][prov_key] = {
                 "npm": "@ai-sdk/openai-compatible",
-                "name": "llama-server (local)",
+                "name": prov_name,
                 "options": {"baseURL": f"http://{v_oc_host.get()}:{v_oc_port.get()}/v1"},
                 "models": {v_oc_mid.get(): {
                     "name": v_oc_name.get(),
@@ -984,22 +1145,78 @@ def _show(llama_config, on_save):
                 }}
             }
             if v_oc_def.get():
-                data["model"] = f"llama.cpp/{v_oc_mid.get()}"
-            elif data.get("model","").startswith("llama.cpp/"):
+                data["model"] = f"{prov_key}/{v_oc_mid.get()}"
+            elif data.get("model", "").startswith(("llama.cpp/", "llama-")):
                 del data["model"]
             _write_json(dst, data)
-            messagebox.showinfo("Saved", f"opencode config written:\n{dst}")
+
+            # ── Save auth.json ────────────────────────────────────────────
+            auth_dst = Path(oc_auth_path_str)
+            auth_data = _rw_json(auth_dst)
+            # Prefer server's API key, fall back to manually-entered value
+            api_key = (srv.get("api_key", "") if srv else "").strip() or v_oc_apikey.get().strip()
+            if api_key:
+                auth_data.setdefault(prov_key, {})
+                auth_data[prov_key]["apiKey"] = api_key
+            elif prov_key in auth_data:
+                del auth_data[prov_key]
+            if auth_data:
+                _write_json(auth_dst, auth_data)
+            elif auth_dst.exists():
+                auth_dst.unlink()
+
+            msg = f"Config written:\n{dst}"
+            if api_key:
+                msg += f"\n\nAuth written:\n{auth_dst}"
+            messagebox.showinfo("Saved", msg)
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    ttk.Button(t_oc, text="💾  Write to opencode config", command=_oc_save
+    ttk.Button(t_oc, text="💾  Save config + auth", command=_oc_save
                ).pack(anchor="e", pady=6)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # TAB 7 — VS Code (native chatLanguageModels.json)
+    # TAB 5 — VS Code
     # ═══════════════════════════════════════════════════════════════════════════
     t_vsc = _tab("VS Code")
     t_vsc.columnconfigure(1, weight=1)
+
+    # ── Server selector for VS Code ───────────────────────────────────────
+    _vsc_servers = llama_config.servers()
+    _vsc_server_names = [f"{s['name']} ({s['host']}:{s['port']})" for s in _vsc_servers]
+    _vsc_selected_server = [None]  # mutable for closure
+
+    _vsc_sf_hdr = tk.LabelFrame(t_vsc, text="Server", padx=8, pady=4)
+    _vsc_sf_hdr.pack(fill="x", pady=(0, 4))
+    _vsc_sf_hdr.columnconfigure(1, weight=1)
+    tk.Label(_vsc_sf_hdr, text="Configure for:", anchor="w").grid(row=0, column=0, sticky="w")
+    _vsc_server_var = tk.StringVar()
+    _vsc_server_cb = ttk.Combobox(_vsc_sf_hdr, textvariable=_vsc_server_var,
+                                   values=_vsc_server_names, state="readonly", width=36)
+    _vsc_server_cb.grid(row=0, column=1, sticky="w", padx=4)
+
+    def _vsc_on_server_select(_event=None):
+        idx = _vsc_server_cb.current()
+        if idx < 0 or idx >= len(_vsc_servers):
+            return
+        srv = _vsc_servers[idx]
+        _vsc_selected_server[0] = srv
+        # Update host/port from selected server
+        v_vsc_host.set(srv.get("host", "127.0.0.1"))
+        v_vsc_port.set(srv.get("port", 8080))
+        v_vsc_in.set(srv.get("ctx_size", 4096))
+        m = srv.get("active_model", "")
+        if m:
+            stem = Path(m).stem
+            v_vsc_id.set(stem)
+            v_vsc_dname.set(stem.replace("-", " ").replace("_", " "))
+        # Pull API key from server config
+        v_vsc_key.set(srv.get("api_key", "") or "not-required")
+        # Update group name based on server
+        group_name = "llama-local" if srv.get("is_local") else f"llama-{srv['name'].lower().replace(' ', '-')}"
+        v_vsc_group.set(group_name)
+
+    _vsc_server_cb.bind("<<ComboboxSelected>>", _vsc_on_server_select)
 
     # VS Code / derivative native custom endpoint config.
     # The chatLanguageModels.json format is shared by VS Code, VS Code OSS,
@@ -1154,16 +1371,31 @@ def _show(llama_config, on_save):
         row=8, column=0, columnspan=2, sticky="w", pady=4)
 
     def _vsc_sync():
-        c = cfg()
-        v_vsc_host.set(c.get("host", "127.0.0.1"))
-        v_vsc_port.set(c.get("port", 8080))
-        v_vsc_in.set(c.get("ctx_size", 4096))
-        m = c.get("active_model", "")
-        if m:
-            stem = Path(m).stem
-            v_vsc_id.set(stem)
-            v_vsc_dname.set(stem.replace("-"," ").replace("_"," "))
-    ttk.Button(t_vsc, text="↻ Sync from llama_tray config", command=_vsc_sync
+        srv = _vsc_selected_server[0]
+        if srv:
+            v_vsc_host.set(srv.get("host", "127.0.0.1"))
+            v_vsc_port.set(srv.get("port", 8080))
+            v_vsc_in.set(srv.get("ctx_size", 4096))
+            m = srv.get("active_model", "")
+            if m:
+                stem = Path(m).stem
+                v_vsc_id.set(stem)
+                v_vsc_dname.set(stem.replace("-", " ").replace("_", " "))
+            v_vsc_key.set(srv.get("api_key", "") or "not-required")
+            group_name = "llama-local" if srv.get("is_local") else f"llama-{srv['name'].lower().replace(' ', '-')}"
+            v_vsc_group.set(group_name)
+        else:
+            # Fallback to global config
+            c = cfg()
+            v_vsc_host.set(c.get("host", "127.0.0.1"))
+            v_vsc_port.set(c.get("port", 8080))
+            v_vsc_in.set(c.get("ctx_size", 4096))
+            m = c.get("active_model", "")
+            if m:
+                stem = Path(m).stem
+                v_vsc_id.set(stem)
+                v_vsc_dname.set(stem.replace("-", " ").replace("_", " "))
+    ttk.Button(t_vsc, text="↻ Sync from server config", command=_vsc_sync
                ).pack(anchor="w", pady=(4,0))
 
     tk.Label(t_vsc, text="Preview:", fg="#888", font=("Helvetica", 8),
@@ -1247,6 +1479,340 @@ def _show(llama_config, on_save):
 
     ttk.Button(t_vsc, text="💾  Write to chatLanguageModels.json", command=_vsc_save
                ).pack(anchor="e", pady=6)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 6 — Model Router
+    # ═══════════════════════════════════════════════════════════════════════════
+    t_rtr = _tab("Model Router")
+
+    # ── INI file path selector ────────────────────────────────────────────
+    rtr_path_row = tk.Frame(t_rtr)
+    rtr_path_row.pack(fill="x", pady=(0, 6))
+    tk.Label(rtr_path_row, text="INI file:", width=10, anchor="w").pack(side="left")
+    v_rtr_ini = tk.StringVar(value=str(default_models_ini_path()))
+    tk.Entry(rtr_path_row, textvariable=v_rtr_ini, width=50).pack(side="left", padx=4)
+    ttk.Button(rtr_path_row, text="…",
+               command=lambda: _browse_file(v_rtr_ini, [("INI", "*.ini"), ("All", "*")])
+               ).pack(side="left")
+
+    # ── Split: left = defaults + model list, right = editor + preview ─────
+    rtr_panes = ttk.PanedWindow(t_rtr, orient="horizontal")
+    rtr_panes.pack(fill="both", expand=True, pady=4)
+
+    # Left pane: global defaults + model list
+    rtr_left = tk.Frame(rtr_panes)
+    rtr_panes.add(rtr_left, weight=1)
+
+    # Global defaults
+    rtr_def_frame = tk.LabelFrame(rtr_left, text="Global defaults ([*])", padx=6, pady=4)
+    rtr_def_frame.pack(fill="x", pady=(0, 4))
+    rtr_def_frame.columnconfigure(1, weight=1)
+
+    tk.Label(rtr_def_frame, text="Context size", anchor="w", width=12).grid(
+        row=0, column=0, sticky="w", pady=2)
+    v_rtr_def_ctx = tk.StringVar(value="4096")
+    tk.Entry(rtr_def_frame, textvariable=v_rtr_def_ctx, width=10).grid(
+        row=0, column=1, sticky="w", pady=2)
+
+    tk.Label(rtr_def_frame, text="GPU layers", anchor="w", width=12).grid(
+        row=1, column=0, sticky="w", pady=2)
+    v_rtr_def_ngl = tk.StringVar(value="0")
+    tk.Entry(rtr_def_frame, textvariable=v_rtr_def_ngl, width=10).grid(
+        row=1, column=1, sticky="w", pady=2)
+
+    tk.Label(rtr_def_frame, text="Temperature", anchor="w", width=12).grid(
+        row=2, column=0, sticky="w", pady=2)
+    v_rtr_def_temp = tk.StringVar(value="0.7")
+    tk.Entry(rtr_def_frame, textvariable=v_rtr_def_temp, width=10).grid(
+        row=2, column=1, sticky="w", pady=2)
+
+    tk.Label(rtr_def_frame, text="Extra params", anchor="w", width=12).grid(
+        row=3, column=0, sticky="w", pady=2)
+    v_rtr_def_extra = tk.StringVar(value="")
+    tk.Entry(rtr_def_frame, textvariable=v_rtr_def_extra, width=24).grid(
+        row=3, column=1, sticky="ew", pady=2)
+    tk.Label(rtr_def_frame, text="key=value pairs, one per line",
+             fg="#888", font=("Helvetica", 8)).grid(row=4, column=1, sticky="w")
+
+    # Model list
+    tk.Label(rtr_left, text="Models:", font=("Helvetica", 9, "bold"),
+             anchor="w").pack(anchor="w", pady=(4, 2))
+    rtr_model_list = tk.Listbox(rtr_left, height=12, font=("Courier", 9))
+    rtr_model_list.pack(fill="both", expand=True)
+
+    rtr_model_btn_row = tk.Frame(rtr_left)
+    rtr_model_btn_row.pack(fill="x", pady=(2, 0))
+    ttk.Button(rtr_model_btn_row, text="+ Add from file",
+               command=lambda: _rtr_add_from_file()).pack(side="left", padx=2)
+    ttk.Button(rtr_model_btn_row, text="+ Add HF repo",
+               command=lambda: _rtr_add_hf()).pack(side="left", padx=2)
+    ttk.Button(rtr_model_btn_row, text="- Remove",
+               command=lambda: _rtr_remove()).pack(side="left", padx=2)
+    ttk.Button(rtr_model_btn_row, text="Toggle active",
+               command=lambda: _rtr_toggle()).pack(side="left", padx=2)
+
+    # Right pane: selected model editor + preview
+    rtr_right = tk.Frame(rtr_panes)
+    rtr_panes.add(rtr_right, weight=2)
+
+    # Model editor (shown when a model is selected)
+    rtr_editor = tk.LabelFrame(rtr_right, text="Model settings", padx=8, pady=6)
+    rtr_editor.pack(fill="x", pady=(0, 4))
+    rtr_editor.columnconfigure(1, weight=1)
+
+    tk.Label(rtr_editor, text="Name", anchor="w", width=12).grid(
+        row=0, column=0, sticky="w", pady=2)
+    v_rtr_mname = tk.StringVar(value="")
+    tk.Entry(rtr_editor, textvariable=v_rtr_mname, width=30).grid(
+        row=0, column=1, sticky="ew", pady=2)
+
+    tk.Label(rtr_editor, text="HF repo:tag", anchor="w", width=12).grid(
+        row=1, column=0, sticky="w", pady=2)
+    v_rtr_mhf = tk.StringVar(value="")
+    tk.Entry(rtr_editor, textvariable=v_rtr_mhf, width=30).grid(
+        row=1, column=1, sticky="ew", pady=2)
+    tk.Label(rtr_editor, text="e.g.bartowski/Llama-3-8B-GGUF:Q4_K_M",
+             fg="#888", font=("Helvetica", 8)).grid(row=2, column=1, sticky="w")
+
+    tk.Label(rtr_editor, text="Local model", anchor="w", width=12).grid(
+        row=3, column=0, sticky="w", pady=2)
+    v_rtr_mlocal = tk.StringVar(value="")
+    rtr_local_row = tk.Frame(rtr_editor)
+    rtr_local_row.grid(row=3, column=1, sticky="ew", pady=2)
+    tk.Entry(rtr_local_row, textvariable=v_rtr_mlocal, width=24).pack(
+        side="left", fill="x", expand=True)
+    ttk.Button(rtr_local_row, text="…", width=3,
+               command=lambda: _browse_file(v_rtr_mlocal, [("GGUF", "*.gguf"), ("All", "*")])
+               ).pack(side="left", padx=2)
+
+    tk.Label(rtr_editor, text="Context size", anchor="w", width=12).grid(
+        row=4, column=0, sticky="w", pady=2)
+    v_rtr_mctx = tk.StringVar(value="")
+    tk.Entry(rtr_editor, textvariable=v_rtr_mctx, width=10).grid(
+        row=4, column=1, sticky="w", pady=2)
+
+    tk.Label(rtr_editor, text="GPU layers", anchor="w", width=12).grid(
+        row=5, column=0, sticky="w", pady=2)
+    v_rtr_mngl = tk.StringVar(value="")
+    tk.Entry(rtr_editor, textvariable=v_rtr_mngl, width=10).grid(
+        row=5, column=1, sticky="w", pady=2)
+
+    tk.Label(rtr_editor, text="Temperature", anchor="w", width=12).grid(
+        row=6, column=0, sticky="w", pady=2)
+    v_rtr_mtemp = tk.StringVar(value="")
+    tk.Entry(rtr_editor, textvariable=v_rtr_mtemp, width=10).grid(
+        row=6, column=1, sticky="w", pady=2)
+
+    tk.Label(rtr_editor, text="Extra params", anchor="w", width=12).grid(
+        row=7, column=0, sticky="w", pady=2)
+    v_rtr_mextra = tk.StringVar(value="")
+    tk.Entry(rtr_editor, textvariable=v_rtr_mextra, width=30).grid(
+        row=7, column=1, sticky="ew", pady=2)
+    tk.Label(rtr_editor, text="key=value pairs, one per line",
+             fg="#888", font=("Helvetica", 8)).grid(row=8, column=1, sticky="w")
+
+    ttk.Button(rtr_editor, text="Apply changes",
+               command=lambda: _rtr_apply_model()).grid(row=9, column=1, sticky="w", pady=(4, 0))
+
+    # Preview
+    tk.Label(rtr_right, text="Preview:", fg="#888", font=("Helvetica", 8),
+             anchor="w").pack(anchor="w", pady=(4, 0))
+    rtr_preview = _code_box(rtr_right, height=10)
+
+    # Status
+    rtr_status = tk.Label(t_rtr, text="", anchor="w", fg="#555", font=("Helvetica", 9))
+    rtr_status.pack(fill="x")
+
+    # ── Router data state ─────────────────────────────────────────────────
+    _rtr_data = {"version": 1, "defaults": {}, "models": []}
+    _rtr_selected_idx = None  # index into _rtr_data["models"]
+
+    def _rtr_load():
+        """Load models.ini into _rtr_data and refresh UI."""
+        nonlocal _rtr_data
+        path = Path(v_rtr_ini.get())
+        _rtr_data = load_models_ini(path)
+
+        # Populate defaults
+        d = _rtr_data.get("defaults", {})
+        v_rtr_def_ctx.set(d.get("c", "4096"))
+        v_rtr_def_ngl.set(d.get("n-gpu-layers", "0"))
+        v_rtr_def_temp.set(d.get("temp", "0.7"))
+        # Extra params: everything except the known keys
+        known = {"c", "n-gpu-layers", "temp"}
+        extra_parts = [f"{k}={v}" for k, v in d.items() if k not in known]
+        v_rtr_def_extra.set("\n".join(extra_parts))
+
+        _rtr_refresh_list()
+        _rtr_update_preview()
+
+    def _rtr_refresh_list():
+        """Refresh the model listbox from _rtr_data."""
+        rtr_model_list.delete(0, tk.END)
+        for m in _rtr_data.get("models", []):
+            marker = "●" if m.get("active", True) else "○"
+            rtr_model_list.insert(tk.END, f" {marker} {m['name']}")
+        rtr_status.config(
+            text=f"{len(_rtr_data.get('models', []))} model(s) in router preset")
+
+    def _rtr_update_preview():
+        """Update the INI preview from current state."""
+        _sync_defaults_to_data()
+        txt = models_ini_as_text(_rtr_data)
+        _code_put(rtr_preview, txt)
+
+    def _sync_defaults_to_data():
+        """Push the defaults UI fields back into _rtr_data."""
+        defaults = {}
+        ctx = v_rtr_def_ctx.get().strip()
+        if ctx:
+            defaults["c"] = ctx
+        ngl = v_rtr_def_ngl.get().strip()
+        if ngl:
+            defaults["n-gpu-layers"] = ngl
+        temp = v_rtr_def_temp.get().strip()
+        if temp:
+            defaults["temp"] = temp
+        # Parse extra params
+        for line in v_rtr_def_extra.get().splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                defaults[k.strip()] = v.strip()
+        _rtr_data["defaults"] = defaults
+
+    def _rtr_on_select(_event):
+        """Show editor for selected model."""
+        nonlocal _rtr_selected_idx
+        sel = rtr_model_list.curselection()
+        if not sel:
+            _rtr_selected_idx = None
+            return
+        idx = sel[0]
+        if idx >= len(_rtr_data.get("models", [])):
+            _rtr_selected_idx = None
+            return
+        _rtr_selected_idx = idx
+        m = _rtr_data["models"][idx]
+        params = m.get("params", {})
+        v_rtr_mname.set(m["name"])
+        v_rtr_mhf.set(params.get("hf", ""))
+        v_rtr_mlocal.set(params.get("model", ""))
+        v_rtr_mctx.set(params.get("c", ""))
+        v_rtr_mngl.set(params.get("n-gpu-layers", ""))
+        v_rtr_mtemp.set(params.get("temp", ""))
+        # Extra params
+        known = {"hf", "model", "c", "n-gpu-layers", "temp"}
+        extra_parts = [f"{k}={v}" for k, v in params.items() if k not in known]
+        v_rtr_mextra.set("\n".join(extra_parts))
+
+    rtr_model_list.bind("<<ListboxSelect>>", _rtr_on_select)
+
+    def _rtr_apply_model():
+        """Push editor fields back into the selected model."""
+        if _rtr_selected_idx is None:
+            return
+        m = _rtr_data["models"][_rtr_selected_idx]
+        m["name"] = v_rtr_mname.get().strip() or m["name"]
+        params = {}
+        hf = v_rtr_mhf.get().strip()
+        if hf:
+            params["hf"] = hf
+        local = v_rtr_mlocal.get().strip()
+        if local:
+            params["model"] = local
+        ctx = v_rtr_mctx.get().strip()
+        if ctx:
+            params["c"] = ctx
+        ngl = v_rtr_mngl.get().strip()
+        if ngl:
+            params["n-gpu-layers"] = ngl
+        temp = v_rtr_mtemp.get().strip()
+        if temp:
+            params["temp"] = temp
+        for line in v_rtr_mextra.get().splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                params[k.strip()] = v.strip()
+        m["params"] = params
+        _rtr_refresh_list()
+        _rtr_update_preview()
+        # Re-select to keep editor in sync
+        rtr_model_list.selection_set(_rtr_selected_idx)
+
+    def _rtr_add_from_file():
+        """Add a local GGUF model to the router."""
+        mdir = Path(cfg().get("models_dir", str(Path.home() / "models")))
+        p = filedialog.askopenfilename(
+            initialdir=str(mdir) if mdir.is_dir() else str(Path.home()),
+            filetypes=[("GGUF", "*.gguf"), ("All files", "*")])
+        if not p:
+            return
+        name = model_name_from_path(p)
+        entry = make_model_entry(name, local_path=p)
+        add_model_to_data(_rtr_data, entry)
+        _rtr_refresh_list()
+        _rtr_update_preview()
+
+    def _rtr_add_hf():
+        """Add a HuggingFace model to the router."""
+        from tkinter import simpledialog
+        hf_id = simpledialog.askstring(
+            "HuggingFace model",
+            "Enter HF repo:tag\n(e.g. bartowski/Llama-3-8B-GGUF:Q4_K_M)")
+        if not hf_id:
+            return
+        # Use last path component as name
+        parts = hf_id.split(":")
+        name = parts[0].split("/")[-1]
+        if len(parts) > 1:
+            name += "-" + parts[1]
+        entry = make_model_entry(name, hf=hf_id)
+        add_model_to_data(_rtr_data, entry)
+        _rtr_refresh_list()
+        _rtr_update_preview()
+
+    def _rtr_remove():
+        """Remove selected model from router."""
+        if _rtr_selected_idx is None:
+            return
+        name = _rtr_data["models"][_rtr_selected_idx]["name"]
+        if messagebox.askyesno("Remove", f"Remove '{name}' from router?"):
+            remove_model_from_data(_rtr_data, name)
+            _rtr_selected_idx = None
+            _rtr_refresh_list()
+            _rtr_update_preview()
+
+    def _rtr_toggle():
+        """Toggle active/inactive for selected model."""
+        if _rtr_selected_idx is None:
+            return
+        m = _rtr_data["models"][_rtr_selected_idx]
+        toggle_model_active(_rtr_data, m["name"], not m.get("active", True))
+        _rtr_refresh_list()
+        _rtr_update_preview()
+        # Update selection
+        rtr_model_list.selection_set(_rtr_selected_idx)
+
+    def _rtr_save():
+        """Write models.ini to disk."""
+        _sync_defaults_to_data()
+        path = Path(v_rtr_ini.get())
+        try:
+            save_models_ini(path, _rtr_data)
+            messagebox.showinfo("Saved", f"Router preset saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # Load initial data
+    root.after(200, _rtr_load)
+
+    # Watch for INI path changes
+    v_rtr_ini.trace_add("write", lambda *_: root.after(100, _rtr_load))
+
+    ttk.Button(t_rtr, text="💾  Save models.ini", command=_rtr_save
+               ).pack(anchor="e", pady=4)
 
     root.mainloop()
 
