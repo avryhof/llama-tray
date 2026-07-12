@@ -10,15 +10,21 @@ import signal
 import threading
 
 import gi
+
 gi.require_version("Gtk", "3.0")
 gi.require_version("AppIndicator3", "0.1")
 
 from gi.repository import Gtk, GLib, AppIndicator3
 
 from tray_base import (
-    LlamaTrayApp, State, APP_NAME, APP_ID, VERSION,
-    make_icon_file, ICON_COLOURS,
+    LlamaTrayApp,
+    APP_NAME,
+    APP_ID,
+    VERSION,
+    make_icon_file,
+    ICON_COLOURS,
 )
+from utility_functions import State, state_manager, build_server_label
 
 
 class LlamaTrayGTK(LlamaTrayApp):
@@ -36,9 +42,7 @@ class LlamaTrayGTK(LlamaTrayApp):
     # ── State management (called on GTK thread) ───────────────────────────
 
     def _set_state(self, server_id: str, state: str):
-        with self._lock:
-            self.states[server_id] = state
-        # Use the most "urgent" state for the tray icon
+        state_manager.set_state(server_id, state)
         self._update_tray_icon()
         self._rebuild_menu()
 
@@ -46,7 +50,7 @@ class LlamaTrayGTK(LlamaTrayApp):
         """Set tray icon to the most urgent server state."""
         priority = [State.ERROR, State.STARTING, State.RUNNING, State.STOPPED]
         worst = State.STOPPED
-        for state in self.states.values():
+        for state in state_manager.all_states().values():
             if priority.index(state) < priority.index(worst):
                 worst = state
         if self._indicator:
@@ -85,7 +89,7 @@ class LlamaTrayGTK(LlamaTrayApp):
             }.get(state, "?")
 
             # Server header (non-clickable)
-            label = f"{state_icon}  {self._server_label(srv)}"
+            label = f"{state_icon}  {build_server_label(srv)}"
             mi(label, enabled=False)
             mi(f"    Model: {self._model_name(srv)}", enabled=False)
 
@@ -97,8 +101,7 @@ class LlamaTrayGTK(LlamaTrayApp):
                     mi("    ⏹  Stop", lambda _, id=sid: self._on_stop(id))
                 else:
                     mi("    ▶  Start", lambda _, id=sid: self._on_start(id))
-                mi("    ↺  Restart", lambda _, id=sid: self._on_restart(id),
-                   enabled=state != State.STOPPED)
+                mi("    ↺  Restart", lambda _, id=sid: self._on_restart(id), enabled=state != State.STOPPED)
             else:
                 # Remote server — check status + model list
                 if state == State.RUNNING:
@@ -109,11 +112,13 @@ class LlamaTrayGTK(LlamaTrayApp):
                     mi("    Offline (error)", enabled=False)
                 else:
                     mi("    Offline", enabled=False)
-                mi("    ↻  Check", lambda _, id=sid: self._on_check_remote(id),
-                   enabled=state in (State.STOPPED, State.ERROR))
+                mi(
+                    "    ↻  Check",
+                    lambda _, id=sid: self._on_check_remote(id),
+                    enabled=state in (State.STOPPED, State.ERROR),
+                )
 
-            mi("    🌐  Open Web UI", lambda _, id=sid: self._on_open_webui(id),
-               enabled=state == State.RUNNING)
+            mi("    🌐  Open Web UI", lambda _, id=sid: self._on_open_webui(id), enabled=state == State.RUNNING)
 
             sep()
 

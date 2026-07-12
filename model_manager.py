@@ -1814,6 +1814,15 @@ def _show(llama_config, on_save):
     ttk.Button(t_rtr, text="💾  Save models.ini", command=_rtr_save
                ).pack(anchor="e", pady=4)
 
+    def _on_close():
+        for name in root.tk.call('info', 'vars'):
+            try:
+                root.tk.call('destroy', name)
+            except Exception:
+                pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
     root.mainloop()
 
 

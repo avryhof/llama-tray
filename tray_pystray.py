@@ -8,9 +8,14 @@ from PIL import Image
 from pystray import Icon, Menu, MenuItem
 
 from tray_base import (
-    LlamaTrayApp, State, APP_NAME, APP_ID, VERSION,
-    make_icon_file, ICON_COLOURS,
+    LlamaTrayApp,
+    APP_NAME,
+    APP_ID,
+    VERSION,
+    make_icon_file,
+    ICON_COLOURS,
 )
+from utility_functions import State, state_manager, build_server_label
 
 
 class LlamaTrayPystray(LlamaTrayApp):
@@ -22,13 +27,12 @@ class LlamaTrayPystray(LlamaTrayApp):
     # ── State management ──────────────────────────────────────────────────
 
     def _set_state(self, server_id: str, state: str):
-        with self._lock:
-            self.states[server_id] = state
+        state_manager.set_state(server_id, state)
         if self._icon:
             # Use the most "urgent" state for the tray icon
             priority = [State.ERROR, State.STARTING, State.RUNNING, State.STOPPED]
             worst = State.STOPPED
-            for s in self.states.values():
+            for s in state_manager.all_states().values():
                 if priority.index(s) < priority.index(worst):
                     worst = s
             self._icon.icon = Image.open(make_icon_file(worst))
@@ -58,34 +62,46 @@ class LlamaTrayPystray(LlamaTrayApp):
             }.get(state, "?")
 
             # Server header
-            items.append(MenuItem(
-                f"{state_icon}  {self._server_label(srv)}",
-                None, enabled=False,
-            ))
-            items.append(MenuItem(
-                f"    Model: {self._model_name(srv)}",
-                None, enabled=False,
-            ))
+            items.append(
+                MenuItem(
+                    f"{state_icon}  {build_server_label(srv)}",
+                    None,
+                    enabled=False,
+                )
+            )
+            items.append(
+                MenuItem(
+                    f"    Model: {self._model_name(srv)}",
+                    None,
+                    enabled=False,
+                )
+            )
 
             # Server actions
             if srv.get("is_local"):
                 if state == State.STARTING:
                     items.append(MenuItem("    Starting…", None, enabled=False))
                 elif state == State.RUNNING:
-                    items.append(MenuItem(
-                        "    ⏹  Stop",
-                        lambda icon, item, id=sid: self._on_stop(id),
-                    ))
+                    items.append(
+                        MenuItem(
+                            "    ⏹  Stop",
+                            lambda icon, item, id=sid: self._on_stop(id),
+                        )
+                    )
                 else:
-                    items.append(MenuItem(
-                        "    ▶  Start",
-                        lambda icon, item, id=sid: self._on_start(id),
-                    ))
-                items.append(MenuItem(
-                    "    ↺  Restart",
-                    lambda icon, item, id=sid: self._on_restart(id),
-                    enabled=state != State.STOPPED,
-                ))
+                    items.append(
+                        MenuItem(
+                            "    ▶  Start",
+                            lambda icon, item, id=sid: self._on_start(id),
+                        )
+                    )
+                items.append(
+                    MenuItem(
+                        "    ↺  Restart",
+                        lambda icon, item, id=sid: self._on_restart(id),
+                        enabled=state != State.STOPPED,
+                    )
+                )
             else:
                 # Remote server — check status + model list
                 if state == State.RUNNING:
@@ -96,17 +112,21 @@ class LlamaTrayPystray(LlamaTrayApp):
                     items.append(MenuItem("    Offline (error)", None, enabled=False))
                 else:
                     items.append(MenuItem("    Offline", None, enabled=False))
-                items.append(MenuItem(
-                    "    ↻  Check",
-                    lambda icon, item, id=sid: self._on_check_remote(id),
-                    enabled=state in (State.STOPPED, State.ERROR),
-                ))
+                items.append(
+                    MenuItem(
+                        "    ↻  Check",
+                        lambda icon, item, id=sid: self._on_check_remote(id),
+                        enabled=state in (State.STOPPED, State.ERROR),
+                    )
+                )
 
-            items.append(MenuItem(
-                "    🌐  Open Web UI",
-                lambda icon, item, id=sid: self._on_open_webui(id),
-                enabled=state == State.RUNNING,
-            ))
+            items.append(
+                MenuItem(
+                    "    🌐  Open Web UI",
+                    lambda icon, item, id=sid: self._on_open_webui(id),
+                    enabled=state == State.RUNNING,
+                )
+            )
             items.append(Menu.SEPARATOR)
 
         # Global actions

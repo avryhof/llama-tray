@@ -9,14 +9,22 @@ and MCP (Model Context Protocol) tool calling.
 import json
 import re
 import threading
-import time
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import urllib.request
 import urllib.error
-
+import urllib.request
+from tkinter import ttk, messagebox
 
 # ── Markdown renderer for tkinter Text widget ─────────────────────────────────
+from utility_functions import (
+    State,
+    state_manager,
+    build_server_label,
+    build_server_url,
+    build_server_headers,
+    check_server_health,
+    get_server_models,
+)
+
 
 class MarkdownRenderer:
     """Parse basic markdown and render into a tkinter Text widget."""
@@ -41,75 +49,96 @@ class MarkdownRenderer:
         # Italic
         self.text.tag_configure("italic", font=("Sans", 10, "italic"))
         # Inline code
-        self.text.tag_configure("code_inline",
-                                font=("Courier", 9),
-                                background="#2d2d2d", foreground="#e0e0e0",
-                                relief="flat", borderwidth=1)
+        self.text.tag_configure(
+            "code_inline", font=("Courier", 9), background="#2d2d2d", foreground="#e0e0e0", relief="flat", borderwidth=1
+        )
         # Code block
-        self.text.tag_configure("code_block",
-                                font=("Courier", 9),
-                                background="#1e1e2e", foreground="#cdd6f4",
-                                relief="flat", borderwidth=2,
-                                lmargin1=10, lmargin2=10,
-                                spacing1=4, spacing3=4)
+        self.text.tag_configure(
+            "code_block",
+            font=("Courier", 9),
+            background="#1e1e2e",
+            foreground="#cdd6f4",
+            relief="flat",
+            borderwidth=2,
+            lmargin1=10,
+            lmargin2=10,
+            spacing1=4,
+            spacing3=4,
+        )
         # Code block language label
-        self.text.tag_configure("code_lang",
-                                font=("Sans", 8, "italic"),
-                                foreground="#89b4fa")
+        self.text.tag_configure("code_lang", font=("Sans", 8, "italic"), foreground="#89b4fa")
         # Headers
-        self.text.tag_configure("h1", font=("Sans", 13, "bold"),
-                                spacing1=8, spacing3=4)
-        self.text.tag_configure("h2", font=("Sans", 11, "bold"),
-                                spacing1=6, spacing3=3)
-        self.text.tag_configure("h3", font=("Sans", 10, "bold"),
-                                spacing1=4, spacing3=2)
+        self.text.tag_configure("h1", font=("Sans", 13, "bold"), spacing1=8, spacing3=4)
+        self.text.tag_configure("h2", font=("Sans", 11, "bold"), spacing1=6, spacing3=3)
+        self.text.tag_configure("h3", font=("Sans", 10, "bold"), spacing1=4, spacing3=2)
         # List items
-        self.text.tag_configure("list_bullet",
-                                font=("Sans", 10),
-                                lmargin1=20, lmargin2=36,
-                                offset=16)
+        self.text.tag_configure("list_bullet", font=("Sans", 10), lmargin1=20, lmargin2=36, offset=16)
         # User message background
-        self.text.tag_configure("msg_user",
-                                background="#1a3a5c", foreground="#e0e0e0",
-                                lmargin1=6, lmargin2=6,
-                                rmargin=40, spacing1=2, spacing3=6,
-                                relief="flat", borderwidth=0)
+        self.text.tag_configure(
+            "msg_user",
+            background="#1a3a5c",
+            foreground="#e0e0e0",
+            lmargin1=6,
+            lmargin2=6,
+            rmargin=40,
+            spacing1=2,
+            spacing3=6,
+            relief="flat",
+            borderwidth=0,
+        )
         # Assistant message background
-        self.text.tag_configure("msg_assistant",
-                                background="#2d4a2d", foreground="#e0e0e0",
-                                lmargin1=6, lmargin2=6,
-                                rmargin=40, spacing1=2, spacing3=6,
-                                relief="flat", borderwidth=0)
+        self.text.tag_configure(
+            "msg_assistant",
+            background="#2d4a2d",
+            foreground="#e0e0e0",
+            lmargin1=6,
+            lmargin2=6,
+            rmargin=40,
+            spacing1=2,
+            spacing3=6,
+            relief="flat",
+            borderwidth=0,
+        )
         # Role label
-        self.text.tag_configure("role_label",
-                                font=("Sans", 9, "bold"),
-                                foreground="#89b4fa")
+        self.text.tag_configure("role_label", font=("Sans", 9, "bold"), foreground="#89b4fa")
         # System message
-        self.text.tag_configure("msg_system",
-                                background="#3d3d3d", foreground="#aaaaaa",
-                                font=("Sans", 9, "italic"),
-                                lmargin1=6, lmargin2=6,
-                                rmargin=40, spacing1=2, spacing3=6)
+        self.text.tag_configure(
+            "msg_system",
+            background="#3d3d3d",
+            foreground="#aaaaaa",
+            font=("Sans", 9, "italic"),
+            lmargin1=6,
+            lmargin2=6,
+            rmargin=40,
+            spacing1=2,
+            spacing3=6,
+        )
         # Separator
-        self.text.tag_configure("separator",
-                                foreground="#555555",
-                                spacing1=4, spacing3=4)
+        self.text.tag_configure("separator", foreground="#555555", spacing1=4, spacing3=4)
         # Tool call
-        self.text.tag_configure("tool_call",
-                                background="#3d2d1d", foreground="#e0c080",
-                                font=("Courier", 9),
-                                lmargin1=10, lmargin2=10,
-                                spacing1=2, spacing3=2)
+        self.text.tag_configure(
+            "tool_call",
+            background="#3d2d1d",
+            foreground="#e0c080",
+            font=("Courier", 9),
+            lmargin1=10,
+            lmargin2=10,
+            spacing1=2,
+            spacing3=2,
+        )
         # Tool result
-        self.text.tag_configure("tool_result",
-                                background="#2d3d2d", foreground="#a0c0a0",
-                                font=("Courier", 9),
-                                lmargin1=10, lmargin2=10,
-                                spacing1=2, spacing3=2)
+        self.text.tag_configure(
+            "tool_result",
+            background="#2d3d2d",
+            foreground="#a0c0a0",
+            font=("Courier", 9),
+            lmargin1=10,
+            lmargin2=10,
+            spacing1=2,
+            spacing3=2,
+        )
         # Tool label
-        self.text.tag_configure("tool_label",
-                                font=("Sans", 8, "bold"),
-                                foreground="#e0c080")
+        self.text.tag_configure("tool_label", font=("Sans", 8, "bold"), foreground="#e0c080")
 
     def render_role_label(self, role: str):
         """Insert a role label (e.g. '👤 User')."""
@@ -160,7 +189,7 @@ class MarkdownRenderer:
         last_end = 0
         for m in self._CODE_BLOCK.finditer(text):
             if m.start() > last_end:
-                parts.append(("text", text[last_end:m.start()], ""))
+                parts.append(("text", text[last_end: m.start()], ""))
             parts.append(("code_block", m.group(2), m.group(1)))
             last_end = m.end()
         if last_end < len(text):
@@ -216,15 +245,15 @@ class MarkdownRenderer:
         pos = 0
         # Combined pattern for bold, italic, code
         inline_re = re.compile(
-            r"(\*\*(.+?)\*\*)"        # bold
-            r"|(`([^`]+)`)"            # inline code
+            r"(\*\*(.+?)\*\*)"  # bold
+            r"|(`([^`]+)`)"  # inline code
             r"|(?<!\*)(\*(?!\*)(.+?)(?<!\*)\*(?!\*))"  # italic
         )
 
         for m in inline_re.finditer(text):
             # Text before match
             if m.start() > pos:
-                self.text.insert("end", text[pos:m.start()], parent_tag)
+                self.text.insert("end", text[pos: m.start()], parent_tag)
 
             if m.group(2):  # bold
                 self.text.insert("end", m.group(2), "bold")
@@ -247,6 +276,7 @@ class MarkdownRenderer:
 
 # ── SSE streaming parser ──────────────────────────────────────────────────────
 
+
 def _parse_sse_lines(buffer: str):
     """Parse SSE data lines from a streaming response buffer.
 
@@ -266,28 +296,22 @@ def _parse_sse_lines(buffer: str):
 
 # ── Chat window ───────────────────────────────────────────────────────────────
 
+
 def show_chat_window(config):
     """Open the chat interface window."""
     threading.Thread(target=_show, args=(config,), daemon=True).start()
 
 
 def _show(config):
-    try:
-        import tkinter as tk
-        from tkinter import ttk, messagebox, filedialog
-    except ImportError:
-        print("tkinter not available")
-        return
-
     root = tk.Tk()
     root.title("llama.cpp Chat")
-    root.geometry("780x640")
+    root.geometry("780x670")
     root.minsize(500, 400)
 
     # ── State ─────────────────────────────────────────────────────────────
     servers = config.servers()
     # Filter to servers that are likely running (have host/port)
-    server_map = {f"{s['name']} ({s['host']}:{s['port']})": s for s in servers}
+    server_map = {build_server_label(s): s for s in servers}
     server_names = list(server_map.keys())
 
     history_key = "chat_history"
@@ -299,29 +323,37 @@ def _show(config):
 
     # ── MCP setup ──────────────────────────────────────────────────────────
     from mcp_client import MCPManager
+
     mcp_manager = MCPManager()
 
     def _connect_mcp_servers():
         """Connect to all enabled MCP servers."""
+
         def _do():
             for srv in config.mcp_servers():
                 if not srv.get("enabled", True):
                     continue
                 name = srv.get("name", "Unnamed")
-                command = srv.get("command", "")
-                if not command:
-                    continue
-                args = srv.get("args", [])
-                env = srv.get("env", {})
+                transport = srv.get("transport", "stdio")
                 server_id = srv.get("id", "")
-                print(f"MCP: Connecting to {name}...")
+                print(f"MCP: Connecting to {name} (transport={transport})...")
                 ok = mcp_manager.connect_server(
-                    server_id, command, args, env, name, timeout=10)
+                    server_id=server_id,
+                    transport=transport,
+                    command=srv.get("command", ""),
+                    args=srv.get("args", []),
+                    env=srv.get("env", {}),
+                    url=srv.get("url", ""),
+                    headers=srv.get("headers", {}),
+                    name=name,
+                    timeout=10,
+                )
                 if ok:
                     tools = mcp_manager.get_server(server_id).tools
                     print(f"MCP: Connected to {name} ({len(tools)} tools)")
                 else:
                     print(f"MCP: Failed to connect to {name}")
+
         threading.Thread(target=_do, daemon=True).start()
 
     def _get_mcp_tools_for_api() -> list[dict]:
@@ -334,7 +366,7 @@ def _show(config):
                     "name": tool["name"],
                     "description": tool.get("description", ""),
                     "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
-                }
+                },
             }
             api_tools.append(api_tool)
         return api_tools
@@ -352,38 +384,42 @@ def _show(config):
 
     tk.Label(top_bar, text="Server:", font=("Helvetica", 9, "bold")).pack(side="left")
     v_server = tk.StringVar()
-    cb_server = ttk.Combobox(top_bar, textvariable=v_server,
-                              values=server_names, state="readonly", width=30)
+    cb_server = ttk.Combobox(top_bar, textvariable=v_server, values=server_names, state="readonly", width=30)
     cb_server.pack(side="left", padx=(4, 12))
 
     tk.Label(top_bar, text="Model:", font=("Helvetica", 9, "bold")).pack(side="left")
     v_model = tk.StringVar()
-    cb_model = ttk.Combobox(top_bar, textvariable=v_model,
-                             values=[], state="readonly", width=30)
+    cb_model = ttk.Combobox(top_bar, textvariable=v_model, values=[], state="readonly", width=30)
     cb_model.pack(side="left", padx=4)
 
-    lbl_status = tk.Label(top_bar, text="○ Not connected",
-                           fg="#dc3545", font=("Helvetica", 9))
+    lbl_status = tk.Label(top_bar, text="○ Not connected", fg="#dc3545", font=("Helvetica", 9))
     lbl_status.pack(side="right")
+
+    ttk.Button(top_bar, text="↻", command=lambda: _check_server(), width=3).pack(side="right", padx=2)
 
     # ── System prompt ─────────────────────────────────────────────────────
     sp_frame = tk.Frame(root, padx=8, pady=2)
     sp_frame.pack(fill="x")
-    tk.Label(sp_frame, text="System:", font=("Helvetica", 9), width=8,
-             anchor="w").pack(side="left")
+    tk.Label(sp_frame, text="System:", font=("Helvetica", 9), width=8, anchor="w").pack(side="left")
     v_sysprompt = tk.StringVar(value="You are a helpful assistant.")
-    tk.Entry(sp_frame, textvariable=v_sysprompt, width=80).pack(
-        side="left", fill="x", expand=True, padx=4)
+    tk.Entry(sp_frame, textvariable=v_sysprompt, width=80).pack(side="left", fill="x", expand=True, padx=4)
 
     # ── Chat display ──────────────────────────────────────────────────────
     chat_frame = tk.Frame(root, padx=4, pady=4)
     chat_frame.pack(fill="both", expand=True)
 
-    chat_text = tk.Text(chat_frame, wrap="word", font=("Sans", 10),
-                         bg="#1e1e2e", fg="#cdd6f4",
-                         insertbackground="#cdd6f4",
-                         relief="flat", borderwidth=0,
-                         state="disabled", cursor="arrow")
+    chat_text = tk.Text(
+        chat_frame,
+        wrap="word",
+        font=("Sans", 10),
+        bg="#1e1e2e",
+        fg="#cdd6f4",
+        insertbackground="#cdd6f4",
+        relief="flat",
+        borderwidth=0,
+        state="disabled",
+        cursor="arrow",
+    )
     chat_scroll = ttk.Scrollbar(chat_frame, command=chat_text.yview)
     chat_text.config(yscrollcommand=chat_scroll.set)
     chat_scroll.pack(side="right", fill="y")
@@ -395,11 +431,17 @@ def _show(config):
     input_frame = tk.Frame(root, padx=8, pady=6)
     input_frame.pack(fill="x")
 
-    input_text = tk.Text(input_frame, height=3, font=("Sans", 10),
-                          bg="#2d2d2d", fg="#cdd6f4",
-                          insertbackground="#cdd6f4",
-                          relief="flat", borderwidth=1,
-                          wrap="word")
+    input_text = tk.Text(
+        input_frame,
+        height=3,
+        font=("Sans", 10),
+        bg="#2d2d2d",
+        fg="#cdd6f4",
+        insertbackground="#cdd6f4",
+        relief="flat",
+        borderwidth=1,
+        wrap="word",
+    )
     input_text.pack(side="left", fill="both", expand=True)
 
     btn_frame = tk.Frame(input_frame)
@@ -468,89 +510,42 @@ def _show(config):
 
     # ── Server connection check + model list ──────────────────────────────
 
-    def _base_url(srv: dict) -> str:
-        """Build base URL from server config (url field or host:port)."""
-        url = srv.get("url", "").strip()
-        if url:
-            # Normalize: ensure it has a scheme
-            if not url.startswith(("http://", "https://")):
-                url = "http://" + url
-            return url.rstrip("/")
-        else:
-            host = srv.get("host", "127.0.0.1")
-            port = srv.get("port", 8080)
-            return f"http://{host}:{port}"
-
-    def _auth_headers(srv: dict) -> dict:
-        """Build request headers with API key and custom headers."""
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
-        api_key = srv.get("api_key", "").strip()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        # Add custom headers
-        for h in srv.get("custom_headers", []):
-            key = h.get("key", "").strip()
-            value = h.get("value", "").strip()
-            if key:
-                headers[key] = value
-        return headers
-
     def _check_server():
         """Quick health check + fetch model list from the selected server."""
         name = v_server.get()
         srv = server_map.get(name)
         if not srv:
-            lbl_status.config(text="○ No server selected", fg="#dc3545")
+            root.after(0, lambda: lbl_status.config(text="○ No server selected", fg="#dc3545"))
             return
 
-        url = f"{_base_url(srv)}/health"
+        sid = srv["id"]
+        state_manager.set_state(sid, State.STARTING)
+
         def _do():
-            try:
-                req = urllib.request.Request(url, method="GET",
-                                             headers=_auth_headers(srv))
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    if r.status == 200:
-                        root.after(0, lambda: lbl_status.config(
-                            text="● Connected", fg="#28a745"))
-                        _fetch_models(srv)
-                        return
-            except Exception:
-                pass
-            root.after(0, lambda: lbl_status.config(
-                text="○ Not reachable", fg="#dc3545"))
+            if state_manager.get_state(sid) in [State.RUNNING, State.STARTING]:
+                health = check_server_health(srv)
+                if health.get("result") == "ok":
+                    state_manager.set_state(sid, State.RUNNING)
+                    _fetch_models(srv)
+                else:
+                    print(f"Health check failed for {name}: {health.get('message')}")
+                    state_manager.set_state(sid, State.ERROR)
+
         threading.Thread(target=_do, daemon=True).start()
 
     def _fetch_models(srv: dict):
         """Fetch available models from GET /v1/models."""
-        url = f"{_base_url(srv)}/v1/models"
+
         def _do():
-            models = []
-            try:
-                req = urllib.request.Request(url, method="GET",
-                                             headers=_auth_headers(srv))
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    data = json.loads(r.read().decode())
-                    for m in data.get("data", []):
-                        mid = m.get("id", "")
-                        if mid:
-                            models.append(mid)
-            except Exception:
-                # Fallback: use active model name from config
-                active = srv.get("active_model", "")
-                if active:
-                    from pathlib import Path
-                    models = [Path(active).stem]
-                else:
-                    models = ["local"]
+            models = get_server_models(srv)
 
             def _upd():
                 cb_model["values"] = models
                 if models:
                     cb_model.current(0)
+
             root.after(0, _upd)
+
         threading.Thread(target=_do, daemon=True).start()
 
     def _on_server_change(_event=None):
@@ -614,7 +609,9 @@ def _show(config):
             # Track tool calls during streaming
             collected_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
             full_response = []
-            url = f"{_base_url(srv)}/v1/chat/completions"
+
+            base_url = build_server_url(srv)
+            url = f"{base_url}/v1/chat/completions"
             payload = {
                 "model": selected_model,
                 "messages": messages_to_send,
@@ -632,7 +629,7 @@ def _show(config):
             req = urllib.request.Request(
                 url,
                 data=data,
-                headers=_auth_headers(srv),
+                headers=build_server_headers(srv, True),
                 method="POST",
             )
 
@@ -711,19 +708,11 @@ def _show(config):
                 root.after(0, lambda: _append_streaming_token(error_msg))
                 return None, []
             except urllib.error.URLError as e:
-                error_msg = (
-                    f"\n\n[Connection error: {e.reason}]\n"
-                    f"URL: {url}\n"
-                    f"Headers: {dict(req.headers)}"
-                )
+                error_msg = f"\n\n[Connection error: {e.reason}]\n" f"URL: {url}\n" f"Headers: {dict(req.headers)}"
                 root.after(0, lambda: _append_streaming_token(error_msg))
                 return None, []
             except Exception as e:
-                error_msg = (
-                    f"\n\n[Error: {e}]\n"
-                    f"URL: {url}\n"
-                    f"Headers: {dict(req.headers)}"
-                )
+                error_msg = f"\n\n[Error: {e}]\n" f"URL: {url}\n" f"Headers: {dict(req.headers)}"
                 root.after(0, lambda: _append_streaming_token(error_msg))
                 return None, []
 
@@ -767,11 +756,13 @@ def _show(config):
                 # Show result in chat
                 root.after(0, renderer.render_tool_result, tool_name, result)
 
-                results.append({
-                    "tool_call_id": tc.get("id", ""),
-                    "role": "tool",
-                    "content": json.dumps(result),
-                })
+                results.append(
+                    {
+                        "tool_call_id": tc.get("id", ""),
+                        "role": "tool",
+                        "content": json.dumps(result),
+                    }
+                )
             return results
 
         def _do_tool_loop():
@@ -836,8 +827,7 @@ def _show(config):
         """Clear chat history for the current server."""
         sid = current_server_id[0]
         if sid and sid in chat_history:
-            if messagebox.askyesno("Clear chat",
-                                   "Clear conversation history for this server?"):
+            if messagebox.askyesno("Clear chat", "Clear conversation history for this server?"):
                 chat_history.pop(sid, None)
                 config.set(history_key, chat_history)
                 chat_text.config(state="normal")
@@ -856,16 +846,58 @@ def _show(config):
 
     input_text.bind("<Key>", _on_key)
 
+    # ── State manager observer — update status label ──────────────────────
+    def _on_server_state_change(server_id, new_state, old_state):
+        if server_id != current_server_id[0]:
+            return
+
+        def _update():
+            if new_state == State.RUNNING:
+                lbl_status.config(text="● Connected", fg="#28a745")
+            elif new_state == State.ERROR:
+                lbl_status.config(text="○ Not reachable", fg="#dc3545")
+            elif new_state == State.STARTING:
+                lbl_status.config(text="◌ Checking…", fg="#fd7e14")
+            else:
+                lbl_status.config(text="○ Disconnected", fg="#6c757d")
+
+        root.after(0, _update)
+
+    state_manager.add_observer(_on_server_state_change)
+
     # ── Cleanup on window close ───────────────────────────────────────────
     def _on_close():
+        if _health_timer[0]:
+            root.after_cancel(_health_timer[0])
+        state_manager.remove_observer(_on_server_state_change)
         mcp_manager.disconnect_all()
+        for name in root.tk.call("info", "vars"):
+            try:
+                root.tk.call("destroy", name)
+            except Exception:
+                pass
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
     # ── Initial state ─────────────────────────────────────────────────────
+    _health_timer = [None]
+
+    def _periodic_health_check():
+        """Check server health every 30 seconds (skip if local and not running)."""
+        name = v_server.get()
+        srv = server_map.get(name)
+        if srv and srv.get("is_local", False):
+            state = state_manager.get_state(srv["id"])
+            if state not in (State.RUNNING, State.STARTING):
+                _health_timer[0] = root.after(30000, _periodic_health_check)
+                return
+        _check_server()
+        _health_timer[0] = root.after(30000, _periodic_health_check)
+
     if server_names:
         cb_server.current(0)
         _on_server_change()
+        _periodic_health_check()
 
     root.mainloop()

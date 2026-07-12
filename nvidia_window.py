@@ -437,6 +437,11 @@ def _show():
 
     def _on_close():
         _running[0] = False
+        for name in root.tk.call('info', 'vars'):
+            try:
+                root.tk.call('destroy', name)
+            except Exception:
+                pass
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)

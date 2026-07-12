@@ -48,18 +48,27 @@ def _make_server_id() -> str:
 
 def make_mcp_server(
     name: str = "",
+    transport: str = "stdio",
     command: str = "",
     args: list[str] = None,
     env: dict[str, str] = None,
+    url: str = "",
+    headers: dict[str, str] = None,
     enabled: bool = True,
 ) -> dict:
-    """Create a new MCP server config dict."""
+    """Create a new MCP server config dict.
+
+    transport: "stdio", "sse", "streamable-http", "rpc"
+    """
     return {
         "id": _make_server_id(),
         "name": name,
+        "transport": transport,
         "command": command,
         "args": args or [],
         "env": env or {},
+        "url": url,
+        "headers": headers or {},
         "enabled": enabled,
     }
 
@@ -81,6 +90,15 @@ def make_server(
     api_key: str = "",
     url: str = "",
     custom_headers: list[dict[str, str]] = None,
+    n_threads: int = 0,
+    flash_attn: bool = False,
+    cache_type_k: str = "f16",
+    cache_type_v: str = "f16",
+    mlock: bool = False,
+    mmap: bool = True,
+    metrics: bool = False,
+    lora_path: str = "",
+    lora_scale: float = 1.0,
 ) -> dict:
     """Create a new server profile dict."""
     if not llama_server_path:
@@ -103,6 +121,15 @@ def make_server(
         "api_key": api_key,
         "url": url,
         "custom_headers": custom_headers or [],
+        "n_threads": n_threads,
+        "flash_attn": flash_attn,
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v,
+        "mlock": mlock,
+        "mmap": mmap,
+        "metrics": metrics,
+        "lora_path": lora_path,
+        "lora_scale": lora_scale,
     }
 
 
@@ -118,13 +145,85 @@ GLOBAL_DEFAULTS = {
     "tool_vscode_config": "",
     "chat_history": {},
     "mcp_servers": [],
+    "server_presets": [
+        {
+            "name": "Balanced",
+            "description": "Factory defaults — safe starting point",
+            "settings": {},
+        },
+        {
+            "name": "Max Speed",
+            "description": "Flash attn + q4 KV cache — fastest inference, moderate VRAM",
+            "settings": {
+                "flash_attn": True,
+                "cache_type_k": "q4_0",
+                "cache_type_v": "q4_0",
+            },
+        },
+        {
+            "name": "Max VRAM Savings",
+            "description": "Aggressive quant + mlock — minimal VRAM, model stays in RAM",
+            "settings": {
+                "flash_attn": True,
+                "cache_type_k": "q4_0",
+                "cache_type_v": "q4_0",
+                "mlock": True,
+            },
+        },
+        {
+            "name": "CPU Only",
+            "description": "No GPU offload — 8 threads, model locked in RAM",
+            "settings": {
+                "n_gpu_layers": 0,
+                "n_threads": 8,
+                "mlock": True,
+            },
+        },
+        {
+            "name": "Development",
+            "description": "Prometheus /metrics endpoint + mmap — for monitoring/debugging",
+            "settings": {
+                "metrics": True,
+                "mmap": True,
+            },
+        },
+        {
+            "name": "Long Context",
+            "description": "32K context with q8 KV cache — needs ~24 GB VRAM",
+            "settings": {
+                "ctx_size": 32768,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+            },
+        },
+    ],
 }
 
 # Keys that were per-server in the old flat format
 _SERVER_KEYS = [
-    "llama_server_path", "active_model", "host", "port",
-    "ctx_size", "n_parallel", "n_gpu_layers", "extra_flags", "auto_start",
-    "use_router", "models_preset_path", "api_key", "url", "custom_headers",
+    "llama_server_path",
+    "active_model",
+    "host",
+    "port",
+    "ctx_size",
+    "n_parallel",
+    "n_gpu_layers",
+    "extra_flags",
+    "auto_start",
+    "use_router",
+    "models_preset_path",
+    "api_key",
+    "url",
+    "custom_headers",
+    "n_threads",
+    "flash_attn",
+    "cache_type_k",
+    "cache_type_v",
+    "mlock",
+    "mmap",
+    "metrics",
+    "lora_path",
+    "lora_scale",
 ]
 
 DEFAULTS = {

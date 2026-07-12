@@ -8,7 +8,6 @@ Detects the platform and loads the appropriate backend:
 """
 
 import platform
-import sys
 
 
 def main():
@@ -17,6 +16,7 @@ def main():
     if system == "Linux":
         try:
             import gi
+
             gi.require_version("Gtk", "3.0")
             gi.require_version("AppIndicator3", "0.1")
             from gi.repository import Gtk, AppIndicator3  # noqa: F401

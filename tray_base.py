@@ -7,17 +7,25 @@ Supports multiple server profiles. Platform-specific subclasses
 
 import os
 import subprocess
-import tempfile
 import threading
 import time
-import urllib.request
 import webbrowser
 from pathlib import Path
+from urllib import request
 
 from PIL import Image, ImageDraw
 
 from config import Config
 from tool_detect import detect_tools
+from utility_functions import (
+    State,
+    state_manager,
+    build_server_url,
+    build_server_headers,
+    build_server_label,
+    check_server_health,
+    get_server,
+)
 
 APP_NAME = "llama.cpp Server"
 APP_ID = "llama-tray"
@@ -30,15 +38,22 @@ ICON_COLOURS = {
     "error": "#dc3545",
 }
 
-_icon_tmp_files: dict[str, str] = {}
-
 HEALTH_CHECK_INTERVAL = 120  # seconds
 
 
+def _icons_dir() -> Path:
+    """Return the persistent icons directory inside the config folder."""
+    from config import _config_path
+    d = _config_path().parent / "icons"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def make_icon_file(state: str) -> str:
-    """Render a coloured circle+L icon to a temp PNG. Returns the file path."""
-    if state in _icon_tmp_files:
-        return _icon_tmp_files[state]
+    """Return the path to the icon PNG for *state*, generating it if needed."""
+    icon_path = _icons_dir() / f"{state}.png"
+    if icon_path.exists():
+        return str(icon_path)
 
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -48,28 +63,8 @@ def make_icon_file(state: str) -> str:
     draw.ellipse([2, 2, size - 2, size - 2], fill=colour, outline="white", width=2)
     draw.text((18, 12), "L", fill="white")
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    img.save(tmp.name)
-    tmp.close()
-    _icon_tmp_files[state] = tmp.name
-    return tmp.name
-
-
-def cleanup_icon_files():
-    """Remove all temporary icon files."""
-    for p in _icon_tmp_files.values():
-        try:
-            os.unlink(p)
-        except OSError:
-            pass
-    _icon_tmp_files.clear()
-
-
-class State:
-    STOPPED = "stopped"
-    STARTING = "starting"
-    RUNNING = "running"
-    ERROR = "error"
+    img.save(str(icon_path))
+    return str(icon_path)
 
 
 class LlamaTrayApp:
@@ -85,9 +80,8 @@ class LlamaTrayApp:
     def __init__(self):
         self.config: Config = Config()
 
-        # Per-server state
-        self.states: dict[str, str] = {}         # server_id -> state
-        self.server_procs: dict[str, subprocess.Popen] = {}  # server_id -> proc
+        # Per-server subprocess handles
+        self.server_procs: dict[str, subprocess.Popen] = {}
 
         # Shared log buffer (tagged with server names)
         self.log_lines: list[str] = []
@@ -115,52 +109,18 @@ class LlamaTrayApp:
 
         GTK subclass overrides this to use GLib.idle_add.
         """
-        self._set_state(server_id, state)
+        state_manager.set_state(server_id, state)
 
     # ── Server helpers ────────────────────────────────────────────────────
-
-    def _get_server(self, server_id: str) -> dict | None:
-        return self.config.get_server(server_id)
-
-    def _server_label(self, srv: dict) -> str:
-        """Human-readable label: 'My Server (127.0.0.1:8080)'"""
-        return f"{srv['name']} ({srv['host']}:{srv['port']})"
 
     def _model_name(self, srv: dict) -> str:
         m = srv.get("active_model", "")
         return Path(m).name if m else "No model selected"
 
     def _server_state(self, server_id: str) -> str:
-        return self.states.get(server_id, State.STOPPED)
-
-    def _base_url(self, srv: dict) -> str:
-        """Build base URL from server config (url field or host:port)."""
-        url = srv.get("url", "").strip()
-        if url:
-            # Normalize: ensure it has a scheme
-            if not url.startswith(("http://", "https://")):
-                url = "http://" + url
-            return url.rstrip("/")
-        else:
-            host = srv.get("host", "127.0.0.1")
-            port = srv.get("port", 8080)
-            return f"http://{host}:{port}"
-
-    def _server_headers(self, srv: dict) -> dict:
-        """Build request headers with API key and custom headers."""
-        headers = {}
-        api_key = srv.get("api_key", "").strip()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        for h in srv.get("custom_headers", []):
-            key = h.get("key", "").strip()
-            value = h.get("value", "").strip()
-            if key:
-                headers[key] = value
-        return headers
+        return state_manager.get_state(server_id)
 
     # ── Build server command ──────────────────────────────────────────────
-
     def _build_cmd(self, srv: dict) -> list[str]:
         cmd = [srv["llama_server_path"]]
 
@@ -170,16 +130,16 @@ class LlamaTrayApp:
             preset = srv.get("models_preset_path", "")
             if preset:
                 cmd += ["--models-preset", preset]
-            # In router mode, ctx_size and n_gpu_layers come from models.ini
-            # so we only set them if there's no preset (fallback)
         else:
             model = srv.get("active_model", "")
             if model:
                 cmd += ["-m", model]
 
         cmd += [
-            "--host", srv.get("host", "127.0.0.1"),
-            "--port", str(srv.get("port", 8080)),
+            "--host",
+            srv.get("host", "127.0.0.1"),
+            "--port",
+            str(srv.get("port", 8080)),
         ]
 
         if not use_router:
@@ -188,6 +148,33 @@ class LlamaTrayApp:
                 cmd += ["-np", str(srv["n_parallel"])]
             if srv.get("n_gpu_layers", 0) > 0:
                 cmd += ["-ngl", str(srv["n_gpu_layers"])]
+
+        # CPU threads (0 = auto)
+        n_threads = srv.get("n_threads", 0)
+        if n_threads > 0:
+            cmd += ["--threads", str(n_threads)]
+
+        # Flash attention
+        if srv.get("flash_attn", False):
+            cmd += ["--flash-attn"]
+
+        # KV cache quantization
+        cache_k = srv.get("cache_type_k", "f16")
+        if cache_k != "f16":
+            cmd += ["--cache-type-k", cache_k]
+        cache_v = srv.get("cache_type_v", "f16")
+        if cache_v != "f16":
+            cmd += ["--cache-type-v", cache_v]
+
+        # Memory management
+        if srv.get("mlock", False):
+            cmd += ["--mlock"]
+        if not srv.get("mmap", True):
+            cmd += ["--no-mmap"]
+
+        # Prometheus metrics
+        if srv.get("metrics", False):
+            cmd += ["--metrics"]
 
         cmd.append("--log-disable")
 
@@ -229,64 +216,59 @@ class LlamaTrayApp:
 
     def _on_check_remote(self, server_id: str, *args):
         """Check if a remote server is reachable via health endpoint."""
-        srv = self._get_server(server_id)
+        srv = get_server(server_id)
         if not srv:
             return
         name = srv.get("name", "")
         self._notify_state(server_id, State.STARTING)
 
         def _do_check():
-            url = f"{self._base_url(srv)}/health"
-            import urllib.request, urllib.error
-            try:
-                self._log(f"Checking remote server at {self._base_url(srv)}…", name)
-                req = urllib.request.Request(url, method="GET",
-                                             headers=self._server_headers(srv))
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    if r.status == 200:
-                        self._log(f"Remote server online ({url})", name)
-                        self._notify_state(server_id, State.RUNNING)
-                    else:
-                        self._log(f"Remote server returned HTTP {r.status}", name)
-                        self._notify_state(server_id, State.ERROR)
-            except urllib.error.HTTPError as e:
-                self._log(f"Remote server returned HTTP {e.code}: {e.reason}", name)
-                self._notify_state(server_id, State.ERROR)
-            except Exception as e:
-                self._log(f"Remote server unreachable: {e}", name)
+            base = build_server_url(srv)
+            self._log(f"Checking remote server at {base}…", name)
+            result = check_server_health(srv)
+            if result["result"] == "ok":
+                self._log(f"Remote server online ({base})", name)
+                self._notify_state(server_id, State.RUNNING)
+            else:
+                self._log(f"Remote server error: {result['message']}", name)
                 self._notify_state(server_id, State.ERROR)
 
         threading.Thread(target=_do_check, daemon=True).start()
 
     def _on_open_webui(self, server_id: str, *args):
-        srv = self._get_server(server_id)
+        srv = get_server(server_id)
         if srv:
-            webbrowser.open(f"http://{srv['host']}:{srv['port']}")
+            webbrowser.open(build_server_url(srv))
 
     def _on_open_logs(self, *args):
         from log_window import show_log_window
+
         show_log_window(self.log_lines)
 
     def _on_settings(self, *args):
         from settings_window import show_settings_window
+
         show_settings_window(self.config, on_save=self._rebuild_menu)
 
     def _on_model_manager(self, *args):
         from model_manager import show_model_manager
+
         show_model_manager(self.config, on_save=self._rebuild_menu)
 
     def _on_chat(self, *args):
         from chat_window import show_chat_window
+
         show_chat_window(self.config)
 
     def _on_nvidia(self, *args):
         from nvidia_window import show_nvidia_window
+
         show_nvidia_window()
 
     # ── Server lifecycle (background threads) ─────────────────────────────
 
     def _start_thread(self, server_id: str):
-        srv = self._get_server(server_id)
+        srv = get_server(server_id)
         if not srv:
             return
         name = srv["name"]
@@ -324,13 +306,10 @@ class LlamaTrayApp:
             self._notify_state(server_id, State.ERROR)
             return
 
-        threading.Thread(
-            target=self._read_output, args=(server_id,), daemon=True
-        ).start()
+        threading.Thread(target=self._read_output, args=(server_id,), daemon=True).start()
 
-        host = srv.get("host", "127.0.0.1")
-        port = srv.get("port", 8080)
-        url = f"http://{host}:{port}/health"
+        url = build_server_url(srv)
+        headers = build_server_headers(srv)
 
         for _ in range(60):
             time.sleep(0.5)
@@ -340,13 +319,14 @@ class LlamaTrayApp:
                 self._notify_state(server_id, State.ERROR)
                 return
             try:
-                with urllib.request.urlopen(url, timeout=2) as r:
+                req = request.Request(url, headers=headers)
+                with request.urlopen(req, timeout=2) as r:
                     if r.status == 200:
-                        self._log(f"Server ready at http://{host}:{port}", name)
+                        self._log(f"Server ready at {url}", name)
                         self._notify_state(server_id, State.RUNNING)
                         threading.Thread(
                             target=self._health_monitor,
-                            args=(server_id, url),
+                            args=(server_id,),
                             daemon=True,
                         ).start()
                         return
@@ -358,7 +338,7 @@ class LlamaTrayApp:
 
     def _stop_thread(self, server_id: str):
         proc = self.server_procs.get(server_id)
-        srv = self._get_server(server_id)
+        srv = get_server(server_id)
         name = srv["name"] if srv else ""
 
         if proc is None:
@@ -381,30 +361,32 @@ class LlamaTrayApp:
 
     def _read_output(self, server_id: str):
         proc = self.server_procs.get(server_id)
-        srv = self._get_server(server_id)
+        srv = get_server(server_id)
         name = srv["name"] if srv else ""
         if not proc or not proc.stdout:
             return
         for line in proc.stdout:
             self._log(line.rstrip(), name)
 
-    def _health_monitor(self, server_id: str, url: str):
-        srv = self._get_server(server_id)
+    def _health_monitor(self, server_id: str):
+        srv = get_server(server_id)
         name = srv["name"] if srv else ""
+        url = build_server_url(srv)
+        headers = build_server_headers(srv)
         while True:
             time.sleep(HEALTH_CHECK_INTERVAL)
             with self._lock:
-                if self.states.get(server_id) != State.RUNNING:
+                if state_manager.get_state(server_id) != State.RUNNING:
                     break
             try:
-                with urllib.request.urlopen(url, timeout=5) as r:
+                req = request.Request(url, headers=headers)
+                with request.urlopen(req, timeout=5) as r:
                     if r.status != 200:
                         raise ValueError("non-200")
             except Exception:
-                with self._lock:
-                    if self.states.get(server_id) == State.RUNNING:
-                        self._log("Health check failed — server may have crashed.", name)
-                        self._notify_state(server_id, State.ERROR)
+                if state_manager.get_state(server_id) == State.RUNNING:
+                    self._log("Health check failed — server may have crashed.", name)
+                    self._notify_state(server_id, State.ERROR)
                 break
 
     # ── Shared pre-run setup ──────────────────────────────────────────────
@@ -431,23 +413,23 @@ class LlamaTrayApp:
             for tool_name, path in merged.items():
                 self._log(f"[tools] {tool_name}: {path or 'not found'}")
             self._rebuild_menu()
+
         threading.Thread(target=_detect_and_refresh, daemon=True).start()
 
         # Auto-start local servers
         for srv in self.config.servers():
             if srv.get("auto_start") and srv.get("is_local"):
                 sid = srv["id"]
-                self.states[sid] = State.STOPPED
-                threading.Thread(
-                    target=self._start_thread, args=(sid,), daemon=True
-                ).start()
+                state_manager.set_state(sid, State.STOPPED)
+                threading.Thread(target=self._start_thread, args=(sid,), daemon=True).start()
+            elif not srv["is_local"]:
+                self._on_check_remote(srv['id'])
 
     def _quit(self):
-        """Shared quit cleanup: stop all servers and remove temp files."""
+        """Shared quit cleanup: stop all servers."""
         self._log("Quitting…")
         for server_id in list(self.server_procs.keys()):
             self._stop_thread(server_id)
-        cleanup_icon_files()
 
     # ── Abstract methods (must be implemented by subclasses) ───────────────
 

@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 from config import make_server
+from utility_functions import build_server_url, build_server_headers
 
 
 def show_settings_window(config, on_save=None):
@@ -170,6 +171,7 @@ def _show(config, on_save):
     # State for current edits
     servers_copy = [dict(s) for s in config.servers()]
     selected_idx = [None]  # mutable container for closure
+    _apply_fn = [None]     # current apply_changes callable for save()
 
     def refresh_listbox():
         listbox.delete(0, tk.END)
@@ -209,42 +211,141 @@ def _show(config, on_save):
             return var
 
         v_name      = er("Name",          0, srv.get("name", "Server"))
-        v_host      = er("Host",          1, srv.get("host", "127.0.0.1"), width=20)
-        v_port      = sr("Port",          2, srv.get("port", 8080), from_=1, to=65535)
-        v_url       = er("URL",           3, srv.get("url", ""), width=30)
-        tk.Label(detail_frame, text="e.g. https://llama.example.com/ (remote only)",
-                 fg="#888", font=("Helvetica", 8)).grid(row=3, column=1, sticky="w")
         v_local     = tk.BooleanVar(value=srv.get("is_local", True))
         tk.Label(detail_frame, text="Local (can start/stop)", anchor="w",
-                 width=18).grid(row=4, column=0, sticky="w", pady=3)
+                 width=18).grid(row=1, column=0, sticky="w", pady=3)
         tk.Checkbutton(detail_frame, variable=v_local).grid(
-            row=4, column=1, sticky="w", pady=3)
+            row=1, column=1, sticky="w", pady=3)
 
+        # Local: Host + Port  |  Remote: URL — created at same rows, toggled
+        _lbl_host = tk.Label(detail_frame, text="Host", anchor="w", width=18)
+        _lbl_host.grid(row=2, column=0, sticky="w", pady=3)
+        v_host = tk.StringVar(value=srv.get("host", "127.0.0.1"))
+        _ent_host = tk.Entry(detail_frame, textvariable=v_host, width=20)
+        _ent_host.grid(row=2, column=1, sticky="ew", pady=3)
+
+        _lbl_port = tk.Label(detail_frame, text="Port", anchor="w", width=18)
+        _lbl_port.grid(row=3, column=0, sticky="w", pady=3)
+        v_port = tk.IntVar(value=srv.get("port", 8080))
+        _sp_port = tk.Spinbox(detail_frame, textvariable=v_port, from_=1, to=65535, width=8)
+        _sp_port.grid(row=3, column=1, sticky="w", pady=3)
+
+        _lbl_url = tk.Label(detail_frame, text="URL", anchor="w", width=18)
+        _lbl_url.grid(row=2, column=0, sticky="w", pady=3)
+        v_url = tk.StringVar(value=srv.get("url", ""))
+        _ent_url = tk.Entry(detail_frame, textvariable=v_url, width=30)
+        _ent_url.grid(row=2, column=1, sticky="ew", pady=3)
+        _lbl_urlhint = tk.Label(detail_frame, text="e.g. https://llama.example.com/",
+                                fg="#888", font=("Helvetica", 8))
+        _lbl_urlhint.grid(row=3, column=1, sticky="w")
+
+        def _toggle_local_remote(*_):
+            is_loc = v_local.get()
+            for w in (_lbl_host, _ent_host, _lbl_port, _sp_port):
+                w.grid() if is_loc else w.grid_remove()
+            for w in (_lbl_url, _ent_url, _lbl_urlhint):
+                w.grid_remove() if is_loc else w.grid()
+            for w in (_lbl_binary, _frm_binary):
+                w.grid() if is_loc else w.grid_remove()
+            for w in (_lbl_preset, _preset_row_frame):
+                w.grid() if is_loc else w.grid_remove()
+            for w in (_lbl_ctx, _sp_ctx, _lbl_parallel, _sp_parallel,
+                       _lbl_gpu, _sp_gpu):
+                w.grid() if is_loc else w.grid_remove()
+            for w in (_lbl_threads, _sp_threads, _lbl_flash, _chk_flash,
+                       _lbl_cache_k, _cmb_cache_k, _lbl_cache_v, _cmb_cache_v,
+                       _lbl_mlock, _chk_mlock, _lbl_mmap, _chk_mmap,
+                       _lbl_metrics, _chk_metrics):
+                w.grid() if is_loc else w.grid_remove()
+            for w in (_lbl_extra, _ent_extra, _lbl_extra_hint):
+                w.grid() if is_loc else w.grid_remove()
+            _lbl_autostart.config(text="Auto-connect" if not is_loc else "Auto-start")
+
+        v_local.trace_add("write", _toggle_local_remote)
+
+        # ── Separator & Binary ────────────────────────────────────────────
         tk.Label(detail_frame, text="─" * 40, fg="#ccc").grid(
             row=5, column=0, columnspan=2, sticky="w", pady=4)
 
         v_binary = tk.StringVar(value=srv.get("llama_server_path", ""))
-        tk.Label(detail_frame, text="Server binary", anchor="w",
-                 width=18).grid(row=6, column=0, sticky="w", pady=3)
-        bf = tk.Frame(detail_frame)
-        bf.grid(row=6, column=1, sticky="ew", pady=3)
-        tk.Entry(bf, textvariable=v_binary, width=22).pack(side="left", fill="x", expand=True)
+        _lbl_binary = tk.Label(detail_frame, text="Server binary", anchor="w", width=18)
+        _lbl_binary.grid(row=6, column=0, sticky="w", pady=3)
+        _frm_binary = tk.Frame(detail_frame)
+        _frm_binary.grid(row=6, column=1, sticky="ew", pady=3)
+        tk.Entry(_frm_binary, textvariable=v_binary, width=22).pack(side="left", fill="x", expand=True)
         def browse_binary():
             p = filedialog.askopenfilename(
                 initialdir=str(Path(v_binary.get()).parent) if v_binary.get() else str(Path.home()),
                 filetypes=[("All files", "*")])
             if p:
                 v_binary.set(p)
-        ttk.Button(bf, text="…", command=browse_binary, width=3).pack(side="left", padx=2)
+        ttk.Button(_frm_binary, text="…", command=browse_binary, width=3).pack(side="left", padx=2)
 
+        # ── Preset (local-only) ───────────────────────────────────────────
+        def _load_presets():
+            """Load presets from config, with '— None —' prepended."""
+            raw = config.get().get("server_presets", [])
+            presets = {"— None —": {"settings": {}, "description": "Pick individual settings below"}}
+            for p in raw:
+                name = p.get("name", "")
+                if name:
+                    presets[name] = p
+            return presets
+
+        _presets_data = _load_presets()
+        PRESET_NAMES = list(_presets_data.keys())
+
+        _lbl_preset = tk.Label(detail_frame, text="Preset", anchor="w", width=18)
+        _lbl_preset.grid(row=7, column=0, sticky="w", pady=3)
+        _preset_row_frame = tk.Frame(detail_frame)
+        _preset_row_frame.grid(row=7, column=1, sticky="ew", pady=3)
+        v_preset = tk.StringVar(value="— None —")
+        _cmb_preset = ttk.Combobox(_preset_row_frame, textvariable=v_preset,
+                                   values=PRESET_NAMES, state="readonly", width=20)
+        _cmb_preset.pack(side="left")
+        _lbl_preset_hint = tk.Label(detail_frame, text="", fg="#888", font=("Helvetica", 8))
+        _lbl_preset_hint.grid(row=8, column=1, columnspan=2, sticky="w")
+
+        def _open_preset_manager():
+            from preset_manager import open_preset_manager
+            def _on_presets_changed():
+                # Reload presets into the combobox
+                nonlocal _presets_data
+                _presets_data = _load_presets()
+                _cmb_preset["values"] = list(_presets_data.keys())
+            open_preset_manager(root, config, on_change=_on_presets_changed)
+
+        ttk.Button(_preset_row_frame, text="Manage…", command=_open_preset_manager,
+                   width=9).pack(side="left", padx=4)
+
+        def _on_preset_change(*_):
+            name = v_preset.get()
+            preset = _presets_data.get(name, {})
+            hint = preset.get("description", "")
+            _lbl_preset_hint.config(text=hint)
+            vals = preset.get("settings", {})
+            if not vals:
+                return
+            if "flash_attn" in vals:   v_flash.set(vals["flash_attn"])
+            if "cache_type_k" in vals: v_cache_k.set(vals["cache_type_k"])
+            if "cache_type_v" in vals: v_cache_v.set(vals["cache_type_v"])
+            if "mlock" in vals:        v_mlock.set(vals["mlock"])
+            if "mmap" in vals:         v_mmap.set(vals["mmap"])
+            if "metrics" in vals:      v_metrics.set(vals["metrics"])
+            if "n_gpu_layers" in vals: v_gpu.set(vals["n_gpu_layers"])
+            if "n_threads" in vals:    v_threads.set(vals["n_threads"])
+            if "ctx_size" in vals:     v_ctx.set(vals["ctx_size"])
+
+        v_preset.trace_add("write", _on_preset_change)
+
+        # ── Active model ──────────────────────────────────────────────────
         v_model = tk.StringVar(value=srv.get("active_model", ""))
         tk.Label(detail_frame, text="Active model", anchor="w",
-                 width=18).grid(row=7, column=0, sticky="w", pady=3)
+                 width=18).grid(row=9, column=0, sticky="w", pady=3)
         mf = tk.Frame(detail_frame)
-        mf.grid(row=7, column=1, sticky="ew", pady=3)
+        mf.grid(row=9, column=1, sticky="ew", pady=3)
 
         if srv.get("is_local"):
-            # Local server — file picker for GGUF files
             tk.Entry(mf, textvariable=v_model, width=22).pack(side="left", fill="x", expand=True)
             def browse_model():
                 p = filedialog.askopenfilename(
@@ -254,36 +355,35 @@ def _show(config, on_save):
                     v_model.set(p)
             ttk.Button(mf, text="…", command=browse_model, width=3).pack(side="left", padx=2)
         else:
-            # Remote server — dropdown populated from GET /v1/models
             v_model_cb = ttk.Combobox(mf, textvariable=v_model, width=30, state="readonly")
             v_model_cb.pack(side="left", fill="x", expand=True)
 
-            def _build_base_url():
-                """Build base URL from URL field or host:port."""
-                url_val = v_url.get().strip()
-                if url_val:
-                    # Normalize: ensure it has a scheme
-                    if not url_val.startswith(("http://", "https://")):
-                        url_val = "http://" + url_val
-                    # Remove trailing slash for consistency
-                    return url_val.rstrip("/")
-                else:
-                    host = v_host.get().strip() or "127.0.0.1"
-                    port = int(v_port.get()) if v_port.get() else 8080
-                    return f"http://{host}:{port}"
-
             def _fetch_remote_models():
-                """Query the remote server for available models."""
-                base = _build_base_url()
-                api_key = v_apikey.get().strip()
-                url = f"{base}/v1/models"
+                # Build a temp server dict from form values for utility functions
+                _srv = {
+                    "url": v_url.get().strip(),
+                    "host": v_host.get().strip() or "127.0.0.1",
+                    "port": int(v_port.get()) if v_port.get() else 8080,
+                    "api_key": v_apikey.get().strip(),
+                    "custom_headers": [],
+                }
+                # Parse current custom headers from the text widget
+                for line in headers_text.get("1.0", "end").strip().split("\n"):
+                    line = line.strip()
+                    if ":" in line:
+                        hk, hv = line.split(":", 1)
+                        hk = hk.strip()
+                        hv = hv.strip()
+                        if hk:
+                            _srv["custom_headers"].append({"key": hk, "value": hv})
+
+                url = f"{build_server_url(_srv)}/v1/models"
+                headers = build_server_headers(_srv)
+
                 import urllib.request, urllib.error, json as _json
                 def _do():
                     models = []
                     try:
-                        headers = {}
-                        if api_key:
-                            headers["Authorization"] = f"Bearer {api_key}"
                         req = urllib.request.Request(url, headers=headers)
                         with urllib.request.urlopen(req, timeout=5) as r:
                             data = _json.loads(r.read().decode())
@@ -306,32 +406,98 @@ def _show(config, on_save):
                 threading.Thread(target=_do, daemon=True).start()
 
             ttk.Button(mf, text="↻", command=_fetch_remote_models, width=3).pack(side="left", padx=2)
-            # Auto-fetch on first show
             root.after(100, _fetch_remote_models)
 
-        v_ctx      = sr("Context size",   8, srv.get("ctx_size", 4096), from_=512, to=131072)
-        v_parallel = sr("Parallel slots", 9, srv.get("n_parallel", 1), from_=1, to=32)
-        v_gpu      = sr("GPU layers",    10, srv.get("n_gpu_layers", 0), from_=0, to=99)
+        # ── Local-only: ctx, parallel, gpu ────────────────────────────────
+        v_ctx      = sr("Context size",   10, srv.get("ctx_size", 4096), from_=512, to=131072)
+        _lbl_ctx   = detail_frame.grid_slaves(row=10, column=0)[0]
+        _sp_ctx    = detail_frame.grid_slaves(row=10, column=1)[0]
+        v_parallel = sr("Parallel slots", 11, srv.get("n_parallel", 1), from_=1, to=32)
+        _lbl_parallel = detail_frame.grid_slaves(row=11, column=0)[0]
+        _sp_parallel  = detail_frame.grid_slaves(row=11, column=1)[0]
+        v_gpu      = sr("GPU layers",    12, srv.get("n_gpu_layers", 0), from_=0, to=99)
+        _lbl_gpu   = detail_frame.grid_slaves(row=12, column=0)[0]
+        _sp_gpu    = detail_frame.grid_slaves(row=12, column=1)[0]
 
-        tk.Label(detail_frame, text="Extra CLI flags", anchor="w",
-                 width=18).grid(row=11, column=0, sticky="w", pady=3)
+        # ── Local-only: threads, flash, kv cache, mlock, mmap, metrics ───
+        v_threads  = sr("CPU threads",   13, srv.get("n_threads", 0), from_=0, to=128)
+        _lbl_threads = detail_frame.grid_slaves(row=13, column=0)[0]
+        _sp_threads  = detail_frame.grid_slaves(row=13, column=1)[0]
+        tk.Label(detail_frame, text="0 = auto-detect", fg="#888",
+                 font=("Helvetica", 8)).grid(row=14, column=1, sticky="w")
+
+        v_flash = tk.BooleanVar(value=srv.get("flash_attn", False))
+        _lbl_flash = tk.Label(detail_frame, text="Flash attention", anchor="w", width=18)
+        _lbl_flash.grid(row=15, column=0, sticky="w", pady=3)
+        _chk_flash = tk.Checkbutton(detail_frame, variable=v_flash)
+        _chk_flash.grid(row=15, column=1, sticky="w", pady=3)
+        tk.Label(detail_frame, text="-fa — big speed boost on supported GPUs",
+                 fg="#888", font=("Helvetica", 8)).grid(row=16, column=1, sticky="w")
+
+        _lbl_cache_k = tk.Label(detail_frame, text="KV cache type (K)", anchor="w", width=18)
+        _lbl_cache_k.grid(row=17, column=0, sticky="w", pady=3)
+        v_cache_k = tk.StringVar(value=srv.get("cache_type_k", "f16"))
+        _cmb_cache_k = ttk.Combobox(detail_frame, textvariable=v_cache_k,
+                                     values=["f16", "q8_0", "q4_0"], state="readonly", width=8)
+        _cmb_cache_k.grid(row=17, column=1, sticky="w", pady=3)
+        tk.Label(detail_frame, text="f16 = full, q8_0 = half VRAM, q4_0 = quarter VRAM",
+                 fg="#888", font=("Helvetica", 8)).grid(row=18, column=1, sticky="w")
+
+        _lbl_cache_v = tk.Label(detail_frame, text="KV cache type (V)", anchor="w", width=18)
+        _lbl_cache_v.grid(row=19, column=0, sticky="w", pady=3)
+        v_cache_v = tk.StringVar(value=srv.get("cache_type_v", "f16"))
+        _cmb_cache_v = ttk.Combobox(detail_frame, textvariable=v_cache_v,
+                                     values=["f16", "q8_0", "q4_0"], state="readonly", width=8)
+        _cmb_cache_v.grid(row=19, column=1, sticky="w", pady=3)
+
+        v_mlock = tk.BooleanVar(value=srv.get("mlock", False))
+        _lbl_mlock = tk.Label(detail_frame, text="Lock in RAM (mlock)", anchor="w", width=18)
+        _lbl_mlock.grid(row=20, column=0, sticky="w", pady=3)
+        _chk_mlock = tk.Checkbutton(detail_frame, variable=v_mlock)
+        _chk_mlock.grid(row=20, column=1, sticky="w", pady=3)
+        tk.Label(detail_frame, text="Prevent model from being swapped to disk",
+                 fg="#888", font=("Helvetica", 8)).grid(row=21, column=1, sticky="w")
+
+        v_mmap = tk.BooleanVar(value=srv.get("mmap", True))
+        _lbl_mmap = tk.Label(detail_frame, text="Memory map (mmap)", anchor="w", width=18)
+        _lbl_mmap.grid(row=22, column=0, sticky="w", pady=3)
+        _chk_mmap = tk.Checkbutton(detail_frame, variable=v_mmap)
+        _chk_mmap.grid(row=22, column=1, sticky="w", pady=3)
+        tk.Label(detail_frame, text="Memory-mapped I/O — faster load, slight perf cost",
+                 fg="#888", font=("Helvetica", 8)).grid(row=23, column=1, sticky="w")
+
+        v_metrics = tk.BooleanVar(value=srv.get("metrics", False))
+        _lbl_metrics = tk.Label(detail_frame, text="Prometheus metrics", anchor="w", width=18)
+        _lbl_metrics.grid(row=24, column=0, sticky="w", pady=3)
+        _chk_metrics = tk.Checkbutton(detail_frame, variable=v_metrics)
+        _chk_metrics.grid(row=24, column=1, sticky="w", pady=3)
+        tk.Label(detail_frame, text="Enable /metrics endpoint for monitoring",
+                 fg="#888", font=("Helvetica", 8)).grid(row=25, column=1, sticky="w")
+
+        # ── Extra CLI flags ───────────────────────────────────────────────
+        _lbl_extra = tk.Label(detail_frame, text="Extra CLI flags", anchor="w", width=18)
+        _lbl_extra.grid(row=26, column=0, sticky="w", pady=3)
         v_extra = tk.StringVar(value=srv.get("extra_flags", ""))
-        tk.Entry(detail_frame, textvariable=v_extra, width=30).grid(
-            row=11, column=1, sticky="ew", pady=3)
-        tk.Label(detail_frame, text="e.g. --threads 8 --mlock",
-                 fg="#888", font=("Helvetica", 8)).grid(row=12, column=1, sticky="w")
+        _ent_extra = tk.Entry(detail_frame, textvariable=v_extra, width=30)
+        _ent_extra.grid(row=26, column=1, sticky="ew", pady=3)
+        _lbl_extra_hint = tk.Label(detail_frame, text="e.g. --threads 8 --mlock",
+                                   fg="#888", font=("Helvetica", 8))
+        _lbl_extra_hint.grid(row=27, column=1, sticky="w")
 
+        # ── Auto-start / Auto-connect (created before _toggle so ref exists) ─
         v_autostart = tk.BooleanVar(value=srv.get("auto_start", False))
-        tk.Label(detail_frame, text="Auto-start", anchor="w",
-                 width=18).grid(row=13, column=0, sticky="w", pady=3)
+        _lbl_autostart = tk.Label(detail_frame, text="Auto-start", anchor="w", width=18)
+        _lbl_autostart.grid(row=28, column=0, sticky="w", pady=3)
         tk.Checkbutton(detail_frame, variable=v_autostart).grid(
-            row=13, column=1, sticky="w", pady=3)
+            row=28, column=1, sticky="w", pady=3)
+
+        _toggle_local_remote()
 
         # ── API Key ───────────────────────────────────────────────────────
-        lbl(detail_frame, "API key", 14)
+        lbl(detail_frame, "API key", 29)
         v_apikey = tk.StringVar(value=srv.get("api_key", ""))
         akf = tk.Frame(detail_frame)
-        akf.grid(row=14, column=1, sticky="ew", pady=3)
+        akf.grid(row=29, column=1, sticky="ew", pady=3)
         akf.columnconfigure(0, weight=1)
         ak_entry = tk.Entry(akf, textvariable=v_apikey, show="*")
         ak_entry.grid(row=0, column=0, sticky="ew")
@@ -344,22 +510,22 @@ def _show(config, on_save):
                                relief="flat", font=("Helvetica", 10))
         ak_toggle.grid(row=0, column=1, padx=2)
         tk.Label(detail_frame, text="Used for server auth + tool configs",
-                 fg="#888", font=("Helvetica", 8)).grid(row=15, column=1, sticky="w")
+                 fg="#888", font=("Helvetica", 8)).grid(row=30, column=1, sticky="w")
 
         # ── Custom Headers ────────────────────────────────────────────────
         tk.Label(detail_frame, text="Custom headers", anchor="w",
-                 width=18).grid(row=16, column=0, sticky="nw", pady=3)
+                 width=18).grid(row=31, column=0, sticky="nw", pady=3)
         headers_text = tk.Text(detail_frame, height=3, width=30,
                                font=("Courier", 9))
-        headers_text.grid(row=16, column=1, sticky="ew", pady=3)
+        headers_text.grid(row=31, column=1, sticky="ew", pady=3)
         custom_headers = srv.get("custom_headers", [])
         headers_str = "\n".join(f"{h['key']}: {h['value']}" for h in custom_headers)
         headers_text.insert("1.0", headers_str)
         tk.Label(detail_frame, text="One per line: Key: Value",
-                 fg="#888", font=("Helvetica", 8)).grid(row=17, column=1, sticky="w")
+                 fg="#888", font=("Helvetica", 8)).grid(row=32, column=1, sticky="w")
 
         # ── Model Router section (local servers only) ─────────────────────
-        row = 18
+        row = 33
         if srv.get("is_local"):
             tk.Label(detail_frame, text="─" * 40, fg="#ccc").grid(
                 row=row, column=0, columnspan=2, sticky="w", pady=4)
@@ -421,12 +587,22 @@ def _show(config, on_save):
                 "use_router": v_router.get(),
                 "models_preset_path": v_preset.get().strip(),
                 "custom_headers": custom_hdrs,
+                # New local-only fields
+                "n_threads": int(v_threads.get()),
+                "flash_attn": v_flash.get(),
+                "cache_type_k": v_cache_k.get(),
+                "cache_type_v": v_cache_v.get(),
+                "mlock": v_mlock.get(),
+                "mmap": v_mmap.get(),
+                "metrics": v_metrics.get(),
             })
             refresh_listbox()
             listbox.selection_set(idx)
 
         apply_btn = ttk.Button(detail_frame, text="Apply", command=apply_changes)
         apply_btn.grid(row=row, column=1, sticky="w", pady=(8, 0))
+
+        _apply_fn[0] = apply_changes
 
     def on_list_select(_event):
         sel = listbox.curselection()
@@ -630,6 +806,19 @@ def _show(config, on_save):
         srv = mcp_servers_copy[idx]
         mcp_detail_frame.columnconfigure(1, weight=1)
 
+        TRANSPORTS = [
+            ("stdio",          "Stdio (subprocess)"),
+            ("sse",            "SSE (Server-Sent Events)"),
+            ("streamable-http", "Streamable HTTP"),
+            ("rpc",            "TCP RPC"),
+        ]
+        TRANSPORT_HINTS = {
+            "stdio":          "Spawns a local process, communicates via stdin/stdout",
+            "sse":            "HTTP GET /sse for events, POST /message for requests",
+            "streamable-http": "HTTP POST /mcp with streaming JSON responses",
+            "rpc":            "TCP socket JSON-RPC 2.0 (host:port)",
+        }
+
         def er(label, row, default="", width=30):
             tk.Label(mcp_detail_frame, text=label, anchor="w", width=18).grid(
                 row=row, column=0, sticky="w", pady=3)
@@ -638,32 +827,127 @@ def _show(config, on_save):
                 row=row, column=1, sticky="ew", pady=3)
             return var
 
-        v_name = er("Name", 0, srv.get("name", ""))
-        v_command = er("Command", 1, srv.get("command", ""))
-        v_args = er("Arguments", 2, " ".join(srv.get("args", [])))
-        v_enabled = tk.BooleanVar(value=srv.get("enabled", True))
-        tk.Label(mcp_detail_frame, text="Enabled", anchor="w", width=18).grid(
-            row=3, column=0, sticky="w", pady=3)
-        tk.Checkbutton(mcp_detail_frame, variable=v_enabled).grid(
-            row=3, column=1, sticky="w", pady=3)
+        row = 0
+        v_name = er("Name", row, srv.get("name", ""))
+        row += 1
 
-        # Environment variables (as key=value pairs, one per line)
-        tk.Label(mcp_detail_frame, text="Environment", anchor="w", width=18).grid(
-            row=4, column=0, sticky="nw", pady=3)
+        # Transport selector
+        tk.Label(mcp_detail_frame, text="Transport", anchor="w", width=18).grid(
+            row=row, column=0, sticky="w", pady=3)
+        v_transport = tk.StringVar(value=srv.get("transport", "stdio"))
+        cmb_transport = ttk.Combobox(mcp_detail_frame, textvariable=v_transport,
+                                     values=[t[0] for t in TRANSPORTS],
+                                     state="readonly", width=18)
+        cmb_transport.grid(row=row, column=1, sticky="w", pady=3)
+        row += 1
+        _lbl_transport_hint = tk.Label(mcp_detail_frame, text=TRANSPORT_HINTS.get("stdio", ""),
+                                       fg="#888", font=("Helvetica", 8))
+        _lbl_transport_hint.grid(row=row, column=1, columnspan=2, sticky="w")
+        row += 1
+
+        # ── Stdio-only fields ──────────────────────────────────────────────
+        _lbl_command = tk.Label(mcp_detail_frame, text="Command", anchor="w", width=18)
+        _lbl_command.grid(row=row, column=0, sticky="w", pady=3)
+        v_command = tk.StringVar(value=srv.get("command", ""))
+        _ent_command = tk.Entry(mcp_detail_frame, textvariable=v_command, width=30)
+        _ent_command.grid(row=row, column=1, sticky="ew", pady=3)
+        row += 1
+
+        _lbl_args = tk.Label(mcp_detail_frame, text="Arguments", anchor="w", width=18)
+        _lbl_args.grid(row=row, column=0, sticky="w", pady=3)
+        v_args = tk.StringVar(value=" ".join(srv.get("args", [])))
+        _ent_args = tk.Entry(mcp_detail_frame, textvariable=v_args, width=30)
+        _ent_args.grid(row=row, column=1, sticky="ew", pady=3)
+        _lbl_args_hint = tk.Label(mcp_detail_frame, text="Space-separated",
+                                  fg="#888", font=("Helvetica", 8))
+        _lbl_args_hint.grid(row=row, column=2, sticky="w", padx=4)
+        row += 1
+
+        _lbl_env = tk.Label(mcp_detail_frame, text="Environment", anchor="w", width=18)
+        _lbl_env.grid(row=row, column=0, sticky="nw", pady=3)
         env_text = tk.Text(mcp_detail_frame, height=4, width=30,
                            font=("Courier", 9))
-        env_text.grid(row=4, column=1, sticky="ew", pady=3)
+        env_text.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
         env_data = srv.get("env", {})
         env_str = "\n".join(f"{k}={v}" for k, v in env_data.items())
         env_text.insert("1.0", env_str)
+        _lbl_env_hint = tk.Label(mcp_detail_frame, text="KEY=value, one per line",
+                                 fg="#888", font=("Helvetica", 8))
+        _lbl_env_hint.grid(row=row + 1, column=1, columnspan=2, sticky="w")
+        row += 2
 
+        # ── URL-based transport fields (SSE, HTTP, RPC) ────────────────────
+        _lbl_url = tk.Label(mcp_detail_frame, text="URL", anchor="w", width=18)
+        _lbl_url.grid(row=row, column=0, sticky="w", pady=3)
+        v_url = tk.StringVar(value=srv.get("url", ""))
+        _ent_url = tk.Entry(mcp_detail_frame, textvariable=v_url, width=30)
+        _ent_url.grid(row=row, column=1, sticky="ew", pady=3)
+        _lbl_url_hint = tk.Label(mcp_detail_frame, text="",
+                                 fg="#888", font=("Helvetica", 8))
+        _lbl_url_hint.grid(row=row, column=2, sticky="w", padx=4)
+        row += 1
+
+        _lbl_headers = tk.Label(mcp_detail_frame, text="Headers", anchor="w", width=18)
+        _lbl_headers.grid(row=row, column=0, sticky="nw", pady=3)
+        headers_text = tk.Text(mcp_detail_frame, height=3, width=30,
+                               font=("Courier", 9))
+        headers_text.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        hdr_data = srv.get("headers", {})
+        hdr_str = "\n".join(f"{k}: {v}" for k, v in hdr_data.items())
+        headers_text.insert("1.0", hdr_str)
+        _lbl_headers_hint = tk.Label(mcp_detail_frame, text="Key: Value, one per line",
+                                     fg="#888", font=("Helvetica", 8))
+        _lbl_headers_hint.grid(row=row + 1, column=1, columnspan=2, sticky="w")
+        row += 2
+
+        # ── Enabled ────────────────────────────────────────────────────────
+        v_enabled = tk.BooleanVar(value=srv.get("enabled", True))
+        tk.Label(mcp_detail_frame, text="Enabled", anchor="w", width=18).grid(
+            row=row, column=0, sticky="w", pady=3)
+        tk.Checkbutton(mcp_detail_frame, variable=v_enabled).grid(
+            row=row, column=1, sticky="w", pady=3)
+        row += 1
+
+        # ── Toggle visibility based on transport ───────────────────────────
+        _stdio_widgets = (_lbl_command, _ent_command, _lbl_args, _ent_args,
+                          _lbl_args_hint, _lbl_env, env_text, _lbl_env_hint)
+        _url_widgets = (_lbl_url, _ent_url, _lbl_url_hint,
+                        _lbl_headers, headers_text, _lbl_headers_hint)
+
+        def _toggle_transport(*_):
+            t = v_transport.get()
+            _lbl_transport_hint.config(text=TRANSPORT_HINTS.get(t, ""))
+            if t == "stdio":
+                for w in _stdio_widgets:
+                    w.grid()
+                for w in _url_widgets:
+                    w.grid_remove()
+                _lbl_url_hint.config(text="")
+            elif t == "rpc":
+                for w in _stdio_widgets:
+                    w.grid_remove()
+                for w in _url_widgets:
+                    w.grid()
+                _lbl_url_hint.config(text="host:port")
+            else:  # sse, streamable-http
+                for w in _stdio_widgets:
+                    w.grid_remove()
+                for w in _url_widgets:
+                    w.grid()
+                _lbl_url_hint.config(text="https://example.com/mcp")
+
+        v_transport.trace_add("write", _toggle_transport)
+        _toggle_transport()
+
+        # ── Apply ──────────────────────────────────────────────────────────
         def apply_mcp():
             srv["name"] = v_name.get().strip()
+            srv["transport"] = v_transport.get()
             srv["command"] = v_command.get().strip()
-            # Parse args from space-separated string
             srv["args"] = v_args.get().strip().split() if v_args.get().strip() else []
+            srv["url"] = v_url.get().strip()
             srv["enabled"] = v_enabled.get()
-            # Parse env from text widget
+            # Parse env
             env = {}
             for line in env_text.get("1.0", "end").strip().split("\n"):
                 line = line.strip()
@@ -671,13 +955,18 @@ def _show(config, on_save):
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip()
             srv["env"] = env
+            # Parse headers
+            hdrs = {}
+            for line in headers_text.get("1.0", "end").strip().split("\n"):
+                line = line.strip()
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    hdrs[k.strip()] = v.strip()
+            srv["headers"] = hdrs
             refresh_mcp_listbox()
 
-        tk.Label(mcp_detail_frame, text="Format: KEY=value, one per line",
-                 fg="#888", font=("Helvetica", 8)).grid(row=5, column=1, sticky="w")
-
         btn_apply = ttk.Button(mcp_detail_frame, text="Apply", command=apply_mcp)
-        btn_apply.grid(row=6, column=1, sticky="w", pady=8)
+        btn_apply.grid(row=row, column=1, sticky="w", pady=8)
 
     def add_mcp_server():
         from config import make_mcp_server
@@ -715,9 +1004,8 @@ def _show(config, on_save):
     def save():
         try:
             # Apply any pending edits from the detail frame
-            if selected_idx[0] is not None:
-                # Trigger Apply if a server is being edited
-                pass  # edits are applied via the Apply button
+            if selected_idx[0] is not None and _apply_fn[0] is not None:
+                _apply_fn[0]()
 
             # Save global settings
             config.update({
@@ -742,9 +1030,22 @@ def _show(config, on_save):
         if on_save:
             on_save()
         messagebox.showinfo("Saved", "Settings saved.")
+        for name in root.tk.call('info', 'vars'):
+            try:
+                root.tk.call('destroy', name)
+            except Exception:
+                pass
         root.destroy()
 
-    ttk.Button(btn_frame, text="Cancel", command=root.destroy).pack(side="right", padx=4)
+    def _on_cancel():
+        for name in root.tk.call('info', 'vars'):
+            try:
+                root.tk.call('destroy', name)
+            except Exception:
+                pass
+        root.destroy()
+
+    ttk.Button(btn_frame, text="Cancel", command=_on_cancel).pack(side="right", padx=4)
     ttk.Button(btn_frame, text="Save",   command=save).pack(side="right")
 
     root.mainloop()
