@@ -698,29 +698,31 @@ def _show(config, on_save):
     v_tp_oc  = _path_field(t3, 2, "Binary", "tool_opencode_path")
     v_tp_occ = _path_field(t3, 3, "Config file", "tool_opencode_config",
                             filetypes=[("JSON", "*.json"), ("All", "*")])
+    v_tp_oca = _path_field(t3, 4, "Auth file", "tool_opencode_auth",
+                            filetypes=[("JSON", "*.json"), ("All", "*")])
 
     ttk.Separator(t3, orient="horizontal").grid(
-        row=4, column=0, columnspan=2, sticky="ew", pady=6)
+        row=5, column=0, columnspan=2, sticky="ew", pady=6)
 
     # llmfit
     tk.Label(t3, text="llmfit", font=("Helvetica", 9, "bold"),
-             anchor="w").grid(row=5, column=0, columnspan=2, sticky="w")
-    v_tp_lmf = _path_field(t3, 6, "Binary", "tool_llmfit_path")
+             anchor="w").grid(row=6, column=0, columnspan=2, sticky="w")
+    v_tp_lmf = _path_field(t3, 7, "Binary", "tool_llmfit_path")
 
     ttk.Separator(t3, orient="horizontal").grid(
-        row=7, column=0, columnspan=2, sticky="ew", pady=6)
+        row=8, column=0, columnspan=2, sticky="ew", pady=6)
 
     # VS Code
     tk.Label(t3, text="VS Code / IDE Derivatives", font=("Helvetica", 9, "bold"),
-             anchor="w").grid(row=8, column=0, columnspan=2, sticky="w")
-    v_tp_vsc = _path_field(t3, 9, "Binary (code/codium/…)", "tool_vscode_path")
+             anchor="w").grid(row=9, column=0, columnspan=2, sticky="w")
+    v_tp_vsc = _path_field(t3, 10, "Binary (code/codium/…)", "tool_vscode_path")
 
     tk.Label(t3, text="chatLanguageModels.json", anchor="w", width=22).grid(
-        row=10, column=0, sticky="w", pady=3)
+        row=11, column=0, sticky="w", pady=3)
     _vsc_cfg_saved = cfg.get("tool_vscode_config", "")
     v_tp_vsc_cfg = tk.StringVar(value=_vsc_cfg_saved)
     _vsc_cfg_frm = tk.Frame(t3)
-    _vsc_cfg_frm.grid(row=10, column=1, sticky="ew", pady=3, padx=(0, 4))
+    _vsc_cfg_frm.grid(row=11, column=1, sticky="ew", pady=3, padx=(0, 4))
     _vsc_cfg_frm.columnconfigure(0, weight=1)
     tk.Entry(_vsc_cfg_frm, textvariable=v_tp_vsc_cfg).grid(row=0, column=0, sticky="ew")
     _vsc_cfg_dot = tk.Label(_vsc_cfg_frm, text="○", fg="#dc3545", width=2)
@@ -742,10 +744,10 @@ def _show(config, on_save):
     _upd_vsc_cfg()
     tk.Label(t3, text="e.g. ~/.config/VSCodium/User/chatLanguageModels.json",
              fg="#888", font=("Helvetica", 8), anchor="w").grid(
-        row=11, column=1, sticky="w")
+        row=12, column=1, sticky="w")
 
     ttk.Separator(t3, orient="horizontal").grid(
-        row=12, column=0, columnspan=2, sticky="ew", pady=6)
+        row=13, column=0, columnspan=2, sticky="ew", pady=6)
 
     def _tp_redetect():
         from tool_detect import detect_tools
@@ -1013,6 +1015,7 @@ def _show(config, on_save):
                 "hf_token":           v_hf_tok.get().strip(),
                 "tool_opencode_path":   v_tp_oc.get().strip(),
                 "tool_opencode_config": v_tp_occ.get().strip(),
+                "tool_opencode_auth":   v_tp_oca.get().strip(),
                 "tool_llmfit_path":     v_tp_lmf.get().strip(),
                 "tool_vscode_path":     v_tp_vsc.get().strip(),
                 "tool_vscode_config":   v_tp_vsc_cfg.get().strip(),

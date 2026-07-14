@@ -156,7 +156,7 @@ class LlamaTrayApp:
 
         # Flash attention
         if srv.get("flash_attn", False):
-            cmd += ["--flash-attn"]
+            cmd += ["--flash-attn", "on"]
 
         # KV cache quantization
         cache_k = srv.get("cache_type_k", "f16")

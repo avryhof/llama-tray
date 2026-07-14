@@ -287,7 +287,7 @@ def _show(llama_config, on_save):
         if not mdir.is_dir():
             mine_status.config(text=f"Not a directory: {mdir}")
             return
-        files = sorted(mdir.glob("*.gguf"))
+        files = sorted(mdir.rglob("*.gguf"))
         for f in files:
             size_b = f.stat().st_size
             size_s = _fmt_size(size_b)
@@ -897,7 +897,7 @@ def _show(llama_config, on_save):
                     cmd = [b, "download", hf_id, "--quant", quant, "--dest", str(dst)]
                     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                     if proc.returncode == 0:
-                        ggufs = sorted(dst.glob("*.gguf"),
+                        ggufs = sorted(dst.rglob("*.gguf"),
                                        key=lambda f: f.stat().st_mtime)
                         if ggufs:
                             result_file = ggufs[-1]
@@ -987,7 +987,7 @@ def _show(llama_config, on_save):
     _oc_server_cb.bind("<<ComboboxSelected>>", _oc_on_server_select)
 
     oc_cfg_path_str = (snap.get("tool_opencode_config") or str(OPENCODE_CONFIG_DEFAULT))
-    oc_auth_path_str = str(OPENCODE_AUTH_DEFAULT)
+    oc_auth_path_str = (snap.get("tool_opencode_auth") or str(OPENCODE_AUTH_DEFAULT))
     oc_data   = _rw_json(Path(oc_cfg_path_str))
     oc_prov   = oc_data.get("provider", {}).get("llama.cpp", {})
     oc_mods   = oc_prov.get("models", {})
@@ -1542,10 +1542,8 @@ def _show(llama_config, on_save):
 
     rtr_model_btn_row = tk.Frame(rtr_left)
     rtr_model_btn_row.pack(fill="x", pady=(2, 0))
-    ttk.Button(rtr_model_btn_row, text="+ Add from file",
-               command=lambda: _rtr_add_from_file()).pack(side="left", padx=2)
-    ttk.Button(rtr_model_btn_row, text="+ Add HF repo",
-               command=lambda: _rtr_add_hf()).pack(side="left", padx=2)
+    ttk.Button(rtr_model_btn_row, text="+ Add from My Models",
+               command=lambda: _rtr_add_from_mine()).pack(side="left", padx=2)
     ttk.Button(rtr_model_btn_row, text="- Remove",
                command=lambda: _rtr_remove()).pack(side="left", padx=2)
     ttk.Button(rtr_model_btn_row, text="Toggle active",
@@ -1652,8 +1650,10 @@ def _show(llama_config, on_save):
         for m in _rtr_data.get("models", []):
             marker = "●" if m.get("active", True) else "○"
             rtr_model_list.insert(tk.END, f" {marker} {m['name']}")
+        count = len(_rtr_data.get('models', []))
+        hint = " — add more from the My Models tab" if count == 0 else ""
         rtr_status.config(
-            text=f"{len(_rtr_data.get('models', []))} model(s) in router preset")
+            text=f"{count} model(s) in router preset{hint}")
 
     def _rtr_update_preview():
         """Update the INI preview from current state."""
@@ -1741,40 +1741,50 @@ def _show(llama_config, on_save):
         # Re-select to keep editor in sync
         rtr_model_list.selection_set(_rtr_selected_idx)
 
-    def _rtr_add_from_file():
-        """Add a local GGUF model to the router."""
+    def _rtr_add_from_mine():
+        """Show a picker of local GGUF files not yet in the router."""
         mdir = Path(cfg().get("models_dir", str(Path.home() / "models")))
-        p = filedialog.askopenfilename(
-            initialdir=str(mdir) if mdir.is_dir() else str(Path.home()),
-            filetypes=[("GGUF", "*.gguf"), ("All files", "*")])
-        if not p:
+        if not mdir.is_dir():
+            messagebox.showinfo("No models", f"Models directory not found:\n{mdir}")
             return
-        name = model_name_from_path(p)
-        entry = make_model_entry(name, local_path=p)
-        add_model_to_data(_rtr_data, entry)
-        _rtr_refresh_list()
-        _rtr_update_preview()
-
-    def _rtr_add_hf():
-        """Add a HuggingFace model to the router."""
-        from tkinter import simpledialog
-        hf_id = simpledialog.askstring(
-            "HuggingFace model",
-            "Enter HF repo:tag\n(e.g. bartowski/Llama-3-8B-GGUF:Q4_K_M)")
-        if not hf_id:
+        existing = {m["name"] for m in _rtr_data.get("models", [])}
+        files = sorted(mdir.rglob("*.gguf"))
+        candidates = []
+        for f in files:
+            mname = model_name_from_path(f.name)
+            if mname not in existing:
+                candidates.append((mname, str(f)))
+        if not candidates:
+            messagebox.showinfo("All added", "All models in the directory are already in the router.")
             return
-        # Use last path component as name
-        parts = hf_id.split(":")
-        name = parts[0].split("/")[-1]
-        if len(parts) > 1:
-            name += "-" + parts[1]
-        entry = make_model_entry(name, hf=hf_id)
-        add_model_to_data(_rtr_data, entry)
-        _rtr_refresh_list()
-        _rtr_update_preview()
+        # Simple multi-select dialog
+        dlg = tk.Toplevel(root)
+        dlg.title("Add models to router")
+        dlg.geometry("480x360")
+        dlg.transient(root)
+        dlg.grab_set()
+        tk.Label(dlg, text="Select models to add:", anchor="w",
+                 font=("Helvetica", 9, "bold")).pack(fill="x", padx=8, pady=(8, 2))
+        lb = tk.Listbox(dlg, selectmode="multiple", font=("Courier", 9))
+        lb.pack(fill="both", expand=True, padx=8)
+        for mname, fpath in candidates:
+            lb.insert("end", f"  {mname}")
+        btn_frame = tk.Frame(dlg)
+        btn_frame.pack(fill="x", padx=8, pady=6)
+        def _add_selected():
+            for idx in lb.curselection():
+                mname, fpath = candidates[idx]
+                entry = make_model_entry(mname, local_path=fpath)
+                add_model_to_data(_rtr_data, entry)
+            _rtr_refresh_list()
+            _rtr_update_preview()
+            dlg.destroy()
+        ttk.Button(btn_frame, text="Add", command=_add_selected).pack(side="right", padx=2)
+        ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side="right", padx=2)
 
     def _rtr_remove():
         """Remove selected model from router."""
+        nonlocal _rtr_selected_idx
         if _rtr_selected_idx is None:
             return
         name = _rtr_data["models"][_rtr_selected_idx]["name"]
@@ -1786,6 +1796,7 @@ def _show(llama_config, on_save):
 
     def _rtr_toggle():
         """Toggle active/inactive for selected model."""
+        nonlocal _rtr_selected_idx
         if _rtr_selected_idx is None:
             return
         m = _rtr_data["models"][_rtr_selected_idx]

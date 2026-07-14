@@ -4,6 +4,8 @@ tray_pystray.py — Cross-platform system tray using pystray.
 Works on Windows, macOS, and Linux (fallback when GTK3 is unavailable).
 """
 
+from functools import partial
+
 from PIL import Image
 from pystray import Icon, Menu, MenuItem
 
@@ -85,20 +87,20 @@ class LlamaTrayPystray(LlamaTrayApp):
                     items.append(
                         MenuItem(
                             "    ⏹  Stop",
-                            lambda icon, item, id=sid: self._on_stop(id),
+                            partial(self._on_stop, sid),
                         )
                     )
                 else:
                     items.append(
                         MenuItem(
                             "    ▶  Start",
-                            lambda icon, item, id=sid: self._on_start(id),
+                            partial(self._on_start, sid),
                         )
                     )
                 items.append(
                     MenuItem(
                         "    ↺  Restart",
-                        lambda icon, item, id=sid: self._on_restart(id),
+                        partial(self._on_restart, sid),
                         enabled=state != State.STOPPED,
                     )
                 )
@@ -115,17 +117,17 @@ class LlamaTrayPystray(LlamaTrayApp):
                 items.append(
                     MenuItem(
                         "    ↻  Check",
-                        lambda icon, item, id=sid: self._on_check_remote(id),
+                        partial(self._on_check_remote, sid),
                         enabled=state in (State.STOPPED, State.ERROR),
                     )
                 )
 
             items.append(
-                MenuItem(
-                    "    🌐  Open Web UI",
-                    lambda icon, item, id=sid: self._on_open_webui(id),
-                    enabled=state == State.RUNNING,
-                )
+                    MenuItem(
+                        "    🌐  Open Web UI",
+                        partial(self._on_open_webui, sid),
+                        enabled=state == State.RUNNING,
+                    )
             )
             items.append(Menu.SEPARATOR)
 

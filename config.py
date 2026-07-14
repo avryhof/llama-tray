@@ -140,6 +140,7 @@ GLOBAL_DEFAULTS = {
     "hf_search_query": "gguf",
     "tool_opencode_path": "",
     "tool_opencode_config": "",
+    "tool_opencode_auth": "",
     "tool_llmfit_path": "",
     "tool_vscode_path": "",
     "tool_vscode_config": "",

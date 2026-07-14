@@ -178,7 +178,7 @@ def list_gguf_files(models_dir: Path | str) -> list[Path]:
     d = Path(models_dir)
     if not d.is_dir():
         return []
-    return sorted(d.glob("*.gguf"), key=lambda f: f.name.lower())
+    return sorted(d.rglob("*.gguf"), key=lambda f: f.name.lower())
 
 
 def model_name_from_path(path: Path | str) -> str:

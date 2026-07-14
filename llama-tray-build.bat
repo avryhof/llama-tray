@@ -1,1 +1,1 @@
-pyinstaller --onefile --windowed llama-tray.py
+pyinstaller --onefile --windowed main.py
